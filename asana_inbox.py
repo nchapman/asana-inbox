@@ -307,7 +307,9 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Assignee", "Due", "Kind", "Updated", "Also in")
+        cols = self.query_one(DataTable).add_columns(
+            "", "Project", "Done", "Title", "Assignee", "Due", "Kind", "Updated", "Also in")
+        self.mark_col = cols[0]
         self.action_reload()
 
     def action_reload(self) -> None:
@@ -331,9 +333,40 @@ class InboxApp(App):
         self.marked &= {it.id for it in self.items}
         self.refresh_table()
 
+    SCROLLOFF = 3  # rows of context kept above/below the cursor
+
+    def refresh_marks(self) -> None:
+        """Update just the mark column in place: no rebuild, so the view doesn't move."""
+        table = self.query_one(DataTable)
+        for row_key in table.rows:
+            want = "●" if row_key.value in self.marked else ""
+            if table.get_cell(row_key, self.mark_col) != want:
+                table.update_cell(row_key, self.mark_col, want)
+        self.update_status(self.visible())
+
+    def keep_context(self) -> None:
+        """Vim-style scrolloff: keep SCROLLOFF rows visible around the cursor."""
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        row = table.cursor_row
+        visible = table.scrollable_content_region.height - (1 if table.show_header else 0)
+        if visible <= 2 * self.SCROLLOFF + 1:
+            return
+        top = table.scroll_y
+        if row > top + visible - 1 - self.SCROLLOFF:
+            table.scroll_to(y=row - visible + 1 + self.SCROLLOFF, animate=False)
+        elif row < top + self.SCROLLOFF:
+            table.scroll_to(y=max(0, row - self.SCROLLOFF), animate=False)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self.call_after_refresh(self.keep_context)
+
     def refresh_table(self) -> None:
+        """Full rebuild (sort/filter/load/archive); keeps cursor item and scroll offset."""
         table = self.query_one(DataTable)
         cursor_id = self.current_id()
+        scroll_y = table.scroll_y
         table.clear()
         prev_project = None
         shown = self.visible()
@@ -352,8 +385,12 @@ class InboxApp(App):
                 ", ".join(p for p in it.projects if p != it.project)[:60],
                 key=it.id,
             )
+        table.scroll_to(y=scroll_y, animate=False)
         if cursor_id in {it.id for it in shown}:
-            table.move_cursor(row=table.get_row_index(cursor_id))
+            table.move_cursor(row=table.get_row_index(cursor_id), scroll=False)
+        self.update_status(shown)
+
+    def update_status(self, shown: list[InboxItem]) -> None:
         self.title = "Asana Inbox"
         parts = [f"{len(self.items)} items", f"{len(self.marked)} marked", f"sort: {self.sort}"]
         if self.filter is not None:
@@ -379,7 +416,7 @@ class InboxApp(App):
         if cid is None:
             return
         self.marked ^= {cid}
-        self.refresh_table()
+        self.refresh_marks()
         self.query_one(DataTable).action_cursor_down()
 
     def action_toggle_project(self) -> None:
@@ -388,7 +425,7 @@ class InboxApp(App):
             return
         ids = {it.id for it in self.visible() if it.project == cur.project}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
-        self.refresh_table()
+        self.refresh_marks()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a row: show its details."""
@@ -414,12 +451,12 @@ class InboxApp(App):
         unmark = ids <= self.marked
         self.marked = self.marked - ids if unmark else self.marked | ids
         self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} completed tasks")
-        self.refresh_table()
+        self.refresh_marks()
 
     def action_toggle_all(self) -> None:
         ids = {it.id for it in self.visible()}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
-        self.refresh_table()
+        self.refresh_marks()
 
     def action_cycle_sort(self) -> None:
         keys = list(SORTS)
@@ -443,12 +480,13 @@ class InboxApp(App):
                 return
             if mode == "filter":
                 self.filter = rx
+                self.refresh_table()
             else:
                 ids = {it.id for it in self.visible() if rx.search(self.match_text(it))}
                 unmark = mode == "unmark"
                 self.marked = self.marked - ids if unmark else self.marked | ids
                 self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} items")
-            self.refresh_table()
+                self.refresh_marks()
 
         current = self.filter.pattern if mode == "filter" and self.filter is not None else ""
         self.push_screen(RegexPrompt(mode, current), apply)
