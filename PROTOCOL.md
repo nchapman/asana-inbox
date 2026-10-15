@@ -43,7 +43,8 @@ Sub `CurrentDomainUserProjectionInbox` with `db_object_id=<du>` and `inboxThread
 numAdditionalThreads:5, listThreadSize:3, multifilterParams:{objectViewId:…, multifilterList:[], inboxSortOverride:[{sortType:"priority",value:"recency"}]}}`
 The minimal form (only `db_object_id` + `inboxThreadsInfo`) gets `{"msg":"error","reason":"Unexpected internal error"}`.
 The full captured param set is in `SyncClient.sub_inbox` (`asana_web.py`); which keys are required is untested.
-`currentDomainUserId` is sent as a number, `db_object_id` as a string; `objectViewId` is a per-user inbox view id.
+`currentDomainUserId` is sent as a number, `db_object_id` as a string; `objectViewId`
+(`params.inboxThreadsInfo.multifilterParams.objectViewId`) is a per-user inbox view id, required.
 
 - `ServerComputedValue ["currentDomainUserInboxThreads", du, {...}]` → `fields.value`: ordered `InboxThread/<threadId>|<suffix>` ids.
 - `ComputedObject InboxThread/...` → `{notificationThread, threadObject, threadTypeName, notifications:[ids], isArchived}`.
