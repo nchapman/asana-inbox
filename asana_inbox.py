@@ -23,9 +23,9 @@ from typing import Protocol
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid
+from textual.containers import Grid, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
 
 @dataclass
@@ -42,6 +42,8 @@ class InboxItem:
     mine: bool = False  # assigned to the current user
     due: datetime | None = None  # local time; midnight for date-only dues
     due_has_time: bool = False
+    description: str = ""
+    events: list[dict] = field(default_factory=list)  # {time, who, what, text}
 
     def due_text(self) -> Text | str:
         if self.due is None:
@@ -82,6 +84,8 @@ class FakeBackend:
                 url=f"https://app.asana.com/1/0/task/{1000 + i}",
                 assignee=(mine := rnd.random() < 0.3) and "Me" or rnd.choice([None, "Alice", "Bob"]),
                 mine=mine,
+                description="Fake description.\n\nSecond paragraph.",
+                events=[{"time": now.timestamp(), "who": "Alice", "what": "comment", "text": "Looks good"}],
                 due=(now.replace(hour=0, minute=0, second=0, microsecond=0)
                      + timedelta(days=rnd.randint(-10, 20))) if rnd.random() < 0.5 else None,
             )
@@ -145,6 +149,8 @@ class WebBackend:
                      else datetime.combine(date.fromisoformat(it["due_date"]), datetime.min.time())
                      if it.get("due_date") else None),
                 due_has_time=bool(it.get("due_time")),
+                description=it.get("description", ""),
+                events=it.get("events", []),
             ))
         return items
 
@@ -184,6 +190,54 @@ class RegexPrompt(ModalScreen[tuple[str, str] | None]):
         self.dismiss((event.value, self.mode))
 
 
+class Detail(ModalScreen[None]):
+    """Read-only view of one item: metadata, description, and its notifications."""
+
+    BINDINGS = [
+        Binding("escape,q,enter", "dismiss(None)", "Close"),
+        Binding("y", "copy_url", "Copy URL"),
+    ]
+
+    def __init__(self, item: InboxItem):
+        super().__init__()
+        self.item = item
+
+    def compose(self) -> ComposeResult:
+        it = self.item
+        t = Text()
+        t.append(it.title + "\n", style="bold")
+        meta = [("Kind", it.kind), ("Projects", ", ".join(it.projects) or "-"),
+                ("Assignee", ("me" if it.mine else it.assignee) or "-")]
+        if it.due:
+            meta.append(("Due", it.due_text()))
+        if it.completed:
+            meta.append(("Completed", it.completed.strftime("%Y-%m-%d %H:%M")))
+        meta.append(("Link", it.url or "-"))
+        for k, v in meta:
+            t.append(f"{k:>10}: ", style="dim")
+            t.append(v if isinstance(v, Text) else str(v))
+            t.append("\n")
+        if it.description.strip():
+            t.append("\nDescription\n", style="bold underline")
+            t.append(it.description.strip() + "\n")
+        if it.events:
+            t.append("\nNotifications\n", style="bold underline")
+            for e in it.events:
+                when = datetime.fromtimestamp(e["time"]).strftime("%Y-%m-%d %H:%M") if e["time"] else "?"
+                t.append(f"{when}  ", style="dim")
+                t.append(e['who'] or 'Asana', style="bold")
+                t.append(f" · {e['what']}\n")
+                if e["text"].strip():
+                    t.append("    " + e["text"].strip().replace("\n", "\n    ") + "\n")
+        with VerticalScroll(id="detail"):
+            yield Static(t)  # plain Text: no markup interpretation of task content
+
+    def action_copy_url(self) -> None:
+        if self.item.url:
+            self.app.copy_to_clipboard(self.item.url)
+            self.notify(f"Copied {self.item.url}")
+
+
 class Confirm(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
 
@@ -203,7 +257,8 @@ class Confirm(ModalScreen[bool]):
 
 class InboxApp(App):
     CSS = """
-    RegexPrompt, Confirm { align: center middle; }
+    RegexPrompt, Confirm, Detail { align: center middle; }
+    #detail { width: 90%; height: 90%; border: thick $accent; background: $surface; padding: 0 1; }
     RegexPrompt Input { width: 70%; }
     #confirm { grid-size: 2; grid-rows: auto auto; width: 60; height: auto; padding: 1 2;
                border: thick $error; background: $surface; }
@@ -334,6 +389,12 @@ class InboxApp(App):
         ids = {it.id for it in self.visible() if it.project == cur.project}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
         self.refresh_table()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a row: show its details."""
+        item = next((it for it in self.items if it.id == event.row_key.value), None)
+        if item is not None:
+            self.push_screen(Detail(item))
 
     def action_copy_url(self) -> None:
         """Copy the selected item's Asana link via OSC 52 (terminal clipboard escape).

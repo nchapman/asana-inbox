@@ -623,6 +623,22 @@ class SyncClient:
             return f"{d[1]} {day}"
         return obj.get("name") or f"({t['type']} {t['thread']})"
 
+    def events(self, notifs: list[dict]) -> list[dict]:
+        """What each notification is about, oldest first: {time, who, what, text}."""
+        out = []
+        for n in notifs:
+            story = self.store.get("DbObject", n.get("story") or "")
+            kind = story.get("typeName") or "?"
+            what = re.sub(r"(Story|Comment)$", "", kind)
+            what = re.sub(r"(?<!^)(?=[A-Z])", " ", what).lower()  # TaskAssigned -> task assigned
+            out.append({
+                "time": (story.get("__creationTime") or n.get("__creationTime") or 0) / 1000,
+                "who": self.user_name(story.get("creatorDu") or n.get("creatorDu")),
+                "what": "comment" if kind == "CommentStory" else what,
+                "text": story.get("text") or "",
+            })
+        return sorted(out, key=lambda e: e["time"])
+
     def user_name(self, du: str | None) -> str | None:
         if not du:
             return None
@@ -700,6 +716,8 @@ class SyncClient:
                     "due_time": (task["dueTime"] / 1000 if kind == "Task" and task.get("dueTime")
                                  else None),
                     "notifications": nids,
+                    "description": task.get("description") or task.get("text") or "",
+                    "events": self.events(notifs),
                     "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
                 })
         return items
