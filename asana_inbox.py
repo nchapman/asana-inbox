@@ -307,9 +307,12 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        cols = self.query_one(DataTable).add_columns(
-            "", "Project", "Done", "Title", "Assignee", "Due", "Kind", "Updated", "Also in")
-        self.mark_col = cols[0]
+        table = self.query_one(DataTable)
+        # Fixed width: an auto-sized empty column shrinks to 0 and in-place marks become invisible.
+        self.mark_col = table.add_column("", width=1)
+        table.add_column("Project")
+        table.add_column("Done", width=4)
+        table.add_columns("Title", "Assignee", "Due", "Kind", "Updated", "Also in")
         self.action_reload()
 
     def action_reload(self) -> None:
