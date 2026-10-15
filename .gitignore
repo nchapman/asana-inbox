@@ -3,3 +3,4 @@ capture.clean.har
 __pycache__/
 *.jsonl
 cookies*.txt
+.env
