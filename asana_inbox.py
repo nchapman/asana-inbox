@@ -1,12 +1,15 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["textual>=0.80", "httpx>=0.27", "websockets>=13", "certifi"]
+# dependencies = ["textual>=0.80", "httpx>=0.27", "websockets>=13", "certifi", "browser-cookie3>=0.20"]
 # ///
 """Bulk-archive Asana Inbox items from a TUI.
 
     ./asana_inbox.py --du <domain user id> --view <inbox objectViewId>   (or env ASANA_DU / ASANA_VIEW)
     ./asana_inbox.py --fake
+
+Cookies come from the first browser with an Asana login (Firefox, Chrome, Chromium, Brave, Edge);
+see --browser/--profile/--cookies, and `./asana_web.py --help` for exporting a cookie file.
 """
 
 import argparse
@@ -79,10 +82,10 @@ KINDS = {
 class WebBackend:
     """Real Asana inbox via the web app's sync protocol (asana_web.py)."""
 
-    def __init__(self, du: str, view: int | None, profile: str | None, n: int, ignore: set[str]):
+    def __init__(self, du: str, view: int | None, n: int, ignore: set[str], **cookie_source):
         from asana_web import WebInbox  # heavy deps only when used
 
-        self.web = WebInbox(du, view, profile, n)
+        self.web = WebInbox(du, view, n, **cookie_source)
         self.ignore = ignore
 
     def primary_project(self, projects: list[str], kind: str) -> str:
@@ -382,7 +385,11 @@ def main() -> None:
     ap.add_argument("--du", default=os.environ.get("ASANA_DU"), help="domain user id (env ASANA_DU)")
     ap.add_argument("--view", type=int, default=os.environ.get("ASANA_VIEW"),
                     help="inbox objectViewId (env ASANA_VIEW)")
-    ap.add_argument("--profile", help="Firefox profile name or directory")
+    ap.add_argument("--browser", help="cookie source: auto|firefox|chrome|chromium|brave|edge "
+                    "(env ASANA_BROWSER; default auto)")
+    ap.add_argument("--profile", help="browser profile name or directory")
+    ap.add_argument("--cookies", metavar="FILE",
+                    help="cookies.txt / Cookie-header file instead of a browser (env ASANA_COOKIES)")
     ap.add_argument("-n", type=int, default=0, help="threads to load (0 = all)")
     ap.add_argument("--ignore-project", action="append",
                     default=[p for p in os.environ.get("ASANA_IGNORE_PROJECTS", "").split(",") if p],
@@ -395,7 +402,11 @@ def main() -> None:
         if not args.du:
             ap.error("--du (or ASANA_DU) is required unless --fake")
         print("bootstrapping…")
-        backend = WebBackend(args.du, args.view, args.profile, args.n, set(args.ignore_project))
+        try:
+            backend = WebBackend(args.du, args.view, args.n, set(args.ignore_project),
+                                 browser=args.browser, profile=args.profile, cookie_file=args.cookies)
+        except RuntimeError as e:  # AsanaError: no cookies, logged out, HTTP errors
+            raise SystemExit(str(e)) from None
     InboxApp(backend).run()
 
 

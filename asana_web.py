@@ -1,15 +1,28 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx>=0.27", "websockets>=13", "certifi"]
+# dependencies = ["httpx>=0.27", "websockets>=13", "certifi", "browser-cookie3>=0.20"]
 # ///
 """Asana web-app sync client (undocumented protocol, see PROTOCOL.md).
 
-Read-only spike:
-    ./asana_web.py cookies [--profile NAME|PATH]       # check Firefox auth (prints names only)
-    ./asana_web.py bootstrap [--profile ...]           # release, bundle version, start_session, id candidates
+    ./asana_web.py cookies                             # which cookie source is used (prints names only)
+    ./asana_web.py bootstrap                           # release, bundle version, start_session, id candidates
     ./asana_web.py inbox --du ID [--view ID] [-n 50] [--dump frames.jsonl]
     ./asana_web.py archive --du ID THREAD_ID... [--yes]   # dry run without --yes
+
+Cookies (global options, before the subcommand):
+    --browser auto|firefox|chrome|chromium|brave|edge   (env ASANA_BROWSER; default auto = first
+              browser with an Asana login, in that order). Chromium-family cookies are decrypted
+              via the desktop keyring, so it may prompt to unlock it.
+    --profile NAME|PATH   Firefox profile name/dir, or Chromium profile ("Default", "Profile 1",
+              a profile dir or its Cookies file).
+    --cookies FILE        (env ASANA_COOKIES) use a cookie file instead of a browser. Either:
+              * Netscape cookies.txt, e.g. `yt-dlp --cookies-from-browser chrome --cookies FILE`
+                or a "cookies.txt" browser extension, exported while logged in to app.asana.com;
+              * or a Cookie header: DevTools → Network → any app.asana.com request →
+                Copy as cURL, paste the `-H 'Cookie: …'` part (or just its value) into FILE.
+              The file is a live login: `chmod 600` it and keep it out of git.
+              Set ASANA_UA to that browser's User-Agent if Cloudflare complains.
 
 Env: ASANA_UA (User-Agent override), ASANA_FF_CONTAINER (Firefox container id),
      ASANA_DOMAIN (workspace gid; default: last_domain cookie).
@@ -154,18 +167,118 @@ def cookie_header(cookies: list[tuple[str, str, str]], host: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in jar.items())
 
 
+# ---------------------------------------------------------------- other cookie sources
+
+Cookies = list[tuple[str, str, str]]  # (host, name, value)
+
+# browser_cookie3 loader name, config dir under ~/.config (for the UA version)
+CHROMIUMS = {
+    "chrome": ("chrome", "google-chrome"),
+    "chromium": ("chromium", "chromium"),
+    "brave": ("brave", "BraveSoftware/Brave-Browser"),
+    "edge": ("edge", "microsoft-edge"),
+}
+BROWSERS = ["firefox", *CHROMIUMS]
+
+
+def chromium_cookies(browser: str, profile: str | None) -> Cookies:
+    """Decrypts via the desktop keyring (GNOME Keyring / KWallet) using browser_cookie3."""
+    try:
+        import browser_cookie3
+    except ImportError as e:
+        raise AsanaError("browser_cookie3 not installed (run via `uv run`)") from e
+    loader, confdir = CHROMIUMS[browser]
+    if not profile and not (Path.home() / ".config" / confdir).is_dir():
+        raise AsanaError(f"not installed (no ~/.config/{confdir})")
+    cookie_file = None
+    if profile:  # profile dir name ("Default", "Profile 1"), profile dir path, or Cookies file
+        p = Path(profile).expanduser()
+        if not p.exists():
+            p = Path.home() / ".config" / confdir / profile
+        cookie_file = next((str(c) for c in (p, p / "Network/Cookies", p / "Cookies") if c.is_file()), None)
+        if not cookie_file:
+            raise AsanaError(f"no {browser} Cookies file under {p}")
+    try:
+        jar = getattr(browser_cookie3, loader)(cookie_file=cookie_file, domain_name="asana.com")
+    except Exception as e:  # BrowserCookieError, keyring errors, locked DB, ...
+        raise AsanaError(f"{type(e).__name__}: {e}") from e
+    return [(c.domain, c.name, c.value) for c in jar]
+
+
+def chromium_user_agent(browser: str) -> str:
+    _, confdir = CHROMIUMS[browser]
+    f = Path.home() / ".config" / confdir / "Last Version"
+    major = f.read_text().split(".")[0] if f.exists() else "140"
+    return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36")
+
+
+def file_cookies(path: str) -> Cookies:
+    """Netscape cookies.txt (browser extensions, `yt-dlp --cookies-from-browser X --cookies F`),
+    or a raw Cookie header ("name=v; name2=v2", optionally prefixed by `Cookie:` or a pasted
+    `-H 'Cookie: …'` line from DevTools' Copy as cURL)."""
+    text = Path(path).expanduser().read_text()
+    rows = [l.split("\t") for l in text.splitlines() if l.count("\t") >= 6]
+    if rows:
+        out = []
+        for r in rows:
+            host = r[0].removeprefix("#HttpOnly_")
+            if host.endswith("asana.com"):
+                out.append((host, r[5], r[6].rstrip("\r\n")))
+        return out
+    m = re.search(r"cookie:\s*([^'\"\n]+)", text, re.I)
+    header = (m.group(1) if m else text).strip()
+    return [(".asana.com", k.strip(), v.strip())
+            for k, v in (p.split("=", 1) for p in header.split(";") if "=" in p)]
+
+
+def has_login(cookies: Cookies) -> bool:
+    return "ticket=" in cookie_header(cookies, "app.asana.com")
+
+
+def resolve_cookies(browser: str | None = None, profile: str | None = None,
+                    cookie_file: str | None = None, log=None) -> tuple[Cookies, str, str]:
+    """Return (cookies, user agent, description). browser: one of BROWSERS, or "auto"/None
+    to try them in order and take the first with an Asana login. ASANA_UA overrides the UA."""
+    browser = browser or os.environ.get("ASANA_BROWSER") or "auto"
+    cookie_file = cookie_file or os.environ.get("ASANA_COOKIES")
+    override = os.environ.get("ASANA_UA")
+    if cookie_file:
+        return file_cookies(cookie_file), override or UA, f"file {cookie_file}"
+    candidates = BROWSERS if browser == "auto" else [browser]
+    errors = []
+    for b in candidates:
+        try:
+            if b == "firefox":
+                prof = find_profile(profile)
+                cookies, ua, desc = load_cookies(prof), firefox_user_agent(prof), f"firefox {prof}"
+            elif b in CHROMIUMS:
+                cookies, ua, desc = chromium_cookies(b, profile), chromium_user_agent(b), b
+            else:
+                raise AsanaError(f"unknown browser {b!r}; choose from {', '.join(BROWSERS)}")
+        except AsanaError as e:
+            errors.append(f"{b}: {e}")
+            continue
+        if has_login(cookies):
+            return cookies, override or ua, desc
+        errors.append(f"{b}: no Asana login cookies")
+    raise AsanaError("no usable Asana cookies found:\n  " + "\n  ".join(errors)
+                     + "\nLog in to app.asana.com, or pass --cookies FILE (see --help).")
+
+
 # ---------------------------------------------------------------- bootstrap
 
 
 class Session:
-    def __init__(self, profile: Path):
+    def __init__(self, browser: str | None = None, profile: str | None = None,
+                 cookie_file: str | None = None):
         global UA
-        UA = firefox_user_agent(profile)
-        self.cookies = cookies = load_cookies(profile)
+        cookies, UA, self.source = resolve_cookies(browser, profile, cookie_file)
+        self.cookies = cookies
         jar = dict(p.split("=", 1) for p in cookie_header(cookies, "app.asana.com").split("; ") if "=" in p)
         missing = [k for k in ("ticket", "user", "last_domain") if k not in jar]
         if missing:
-            raise AsanaError(f"cookies missing {missing}; log in to Asana in Firefox")
+            raise AsanaError(f"cookies from {self.source} missing {missing}; log in to Asana again")
         self.ticket = jar["ticket"]          # CSRF token, echoed as X-Asana-Ticket
         self.user_id = jar["user"]           # user gid
         self.domain = os.environ.get("ASANA_DOMAIN", jar["last_domain"])  # workspace gid == shard_id
@@ -524,6 +637,7 @@ class SyncClient:
                     "id": f"{t['thread']}/{task_id}" if task_id else t["thread"],
                     "thread": t["thread"],
                     "task_id": task_id,
+                    "url": self.item_url(task, task_id, t),
                     "type": t["type"],
                     "title": task.get("name") or self.fallback_title(t),
                     # Task.completed is 0 or the completion time in ms
@@ -548,9 +662,10 @@ class WebInbox:
     """Blocking wrapper for the TUI. Each call opens a fresh websocket (run it in a worker
     thread); HTTP bootstrap (release, bundle version) is done once and reused."""
 
-    def __init__(self, du: str, view: int | None, profile: str | None = None, n: int = 0):
+    def __init__(self, du: str, view: int | None, n: int = 0, *, browser: str | None = None,
+                 profile: str | None = None, cookie_file: str | None = None):
         self.du, self.view, self.n = du, view, n
-        self.sess = Session(find_profile(profile))
+        self.sess = Session(browser, profile, cookie_file)
         self.rev, bundle = self.sess.release_info()
         self.ver = self.sess.bundle_version(bundle)
         self.notifications: dict[str, list[str]] = {}  # item id -> notification ids
@@ -589,6 +704,12 @@ class WebInbox:
 
 
 def cmd_cookies(args) -> None:
+    cookies, ua, source = resolve_cookies(args.browser, args.profile, args.cookies)
+    print(f"source: {source}\nuser-agent: {ua}")
+    if not source.startswith("firefox"):
+        for host, name, _ in sorted(cookies):
+            print(f"  {host:24} {name}")
+        return
     profile = find_profile(args.profile)
     rows = cookie_rows(profile)
     print(f"profile: {profile}  (using jar originAttributes={wanted_origin()!r})")
@@ -605,7 +726,7 @@ def cmd_cookies(args) -> None:
 
 
 def cmd_bootstrap(args) -> None:
-    sess = Session(find_profile(args.profile))
+    sess = Session(args.browser, args.profile, args.cookies)
     print("user-agent:", UA)
     print(f"user: {sess.user_id}  domain/shard: {sess.domain}")
     rev, bundle = sess.release_info()
@@ -636,7 +757,7 @@ def print_items(items: list[dict]) -> None:
 
 
 async def open_inbox(args) -> tuple[SyncClient, list[dict]]:
-    sess = Session(find_profile(args.profile))
+    sess = Session(args.browser, args.profile, args.cookies)
     rev, bundle = sess.release_info()
     ver = sess.bundle_version(bundle)
     ss = sess.start_session(rev, f"/1/{sess.domain}/inbox/{args.du}")
@@ -699,9 +820,17 @@ async def cmd_archive(args) -> None:
         await client.close()
 
 
+def add_cookie_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--browser", choices=["auto", *BROWSERS],
+                    help="cookie source browser (env ASANA_BROWSER; default auto)")
+    ap.add_argument("--profile", help="browser profile name/dir (default: browser's default)")
+    ap.add_argument("--cookies", metavar="FILE",
+                    help="cookies.txt or Cookie-header file instead of a browser (env ASANA_COOKIES)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", help="Firefox profile name or directory (default: Firefox default)")
+    add_cookie_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("cookies")
     sub.add_parser("bootstrap")
