@@ -623,6 +623,12 @@ class SyncClient:
             return f"{d[1]} {day}"
         return obj.get("name") or f"({t['type']} {t['thread']})"
 
+    def user_name(self, du: str | None) -> str | None:
+        if not du:
+            return None
+        key = json.dumps(["domainUserName", du, {}], separators=(",", ":"))
+        return self.store.get("ServerComputedValue", key).get("value") or du
+
     def task_project_ids(self, task_id: str) -> list[str]:
         key = json.dumps(["taskProjectsContainingThis", task_id, {}], separators=(",", ":"))
         return list(self.store.get("ServerComputedValue", key).get("value") or [])
@@ -686,6 +692,8 @@ class SyncClient:
                     # Task.completed is 0 or the completion time in ms
                     "completed": (task.get("completed") or 0) / 1000 or None,
                     "projects": names,
+                    "assignee": self.user_name(task.get("assignee")) if kind == "Task" else None,
+                    "mine": kind == "Task" and task.get("assignee") == self.du,
                     "notifications": nids,
                     "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
                 })

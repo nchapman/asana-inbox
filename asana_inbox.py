@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid
@@ -37,6 +38,8 @@ class InboxItem:
     projects: list[str] = field(default_factory=list)  # all projects; `project` is the grouping one
     completed: datetime | None = None
     url: str = ""
+    assignee: str | None = None
+    mine: bool = False  # assigned to the current user
 
 
 class Backend(Protocol):
@@ -61,6 +64,8 @@ class FakeBackend:
                 updated=now - timedelta(hours=rnd.randint(1, 24 * 60)),
                 completed=now if rnd.random() < 0.2 else None,
                 url=f"https://app.asana.com/1/0/task/{1000 + i}",
+                assignee=(mine := rnd.random() < 0.3) and "Me" or rnd.choice([None, "Alice", "Bob"]),
+                mine=mine,
             )
             for i in range(n)
         }
@@ -116,6 +121,8 @@ class WebBackend:
                 projects=it["projects"],
                 completed=datetime.fromtimestamp(it["completed"]) if it.get("completed") else None,
                 url=it.get("urls", {}).get(project) or it.get("url", ""),
+                assignee=it.get("assignee"),
+                mine=it.get("mine", False),
             ))
         return items
 
@@ -136,7 +143,8 @@ class RegexPrompt(ModalScreen[tuple[str, str] | None]):
 
     BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
     PLACEHOLDERS = {
-        "mark": "Mark shown items matching regex (project, title, other projects, kind, 'done')",
+        "mark": "Mark shown items matching regex (project, title, other projects, kind, assignee, "
+                "'done', 'mine')",
         "unmark": "Unmark shown items matching regex",
         "filter": "Show only items matching regex (empty = show all)",
     }
@@ -204,7 +212,9 @@ class InboxApp(App):
     @staticmethod
     def match_text(it: InboxItem) -> str:
         done = "done" if it.completed else ""
-        return f"{it.project} {it.title} {' '.join(it.projects)} {it.kind} {done}"
+        mine = "mine" if it.mine else ""
+        return (f"{it.project} {it.title} {' '.join(it.projects)} {it.kind} {done} "
+                f"{it.assignee or ''} {mine}")
 
     def visible(self) -> list[InboxItem]:
         """Items passing the filter; every bulk mark action works on these only."""
@@ -218,7 +228,7 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Kind", "Updated", "Also in")
+        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Assignee", "Kind", "Updated", "Also in")
         self.action_reload()
 
     def action_reload(self) -> None:
@@ -255,7 +265,8 @@ class InboxApp(App):
                 "●" if it.id in self.marked else "",
                 project,
                 "✓" if it.completed else "",
-                it.title,
+                Text(it.title, style="bold" if it.mine else ""),
+                Text("★ me", style="bold yellow") if it.mine else (it.assignee or ""),
                 it.kind,
                 it.updated.strftime("%Y-%m-%d %H:%M"),
                 ", ".join(p for p in it.projects if p != it.project)[:60],
