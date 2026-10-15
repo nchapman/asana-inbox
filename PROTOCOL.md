@@ -57,8 +57,14 @@ The full captured param set is in `SyncClient.sub_inbox` (`asana_web.py`); which
 
 Thread shapes: `TaskNotificationThread` = several notifications about one task;
 `TaskAddedToPotNotificationThread` (threadObject = Pot) = one notification per task added to that
-project, i.e. several different tasks. Also `ConversationNotificationThread`, `DailySummaryNotificationThread`
-(no storyParent task). All notification DbObjects of loaded threads are included (not just `listThreadSize`).
+project, i.e. several different tasks. Also `ConversationNotificationThread` (storyParent = Conversation;
+its projects via Rank ids `Conversation.projectFollowers.<conv>.<pot>`), `PotNotificationThread`
+(storyParent = Pot, e.g. ShareableSharedStory), `ActionRequestNotificationThread` (storyParent =
+RequestShareableAccess `{state, requester, target, message}`), and storyParent = recipient DomainUser
+(no subject): `DailySummaryNotificationThread` (DailySummaryStory.date) and `OverdueTasksReminderThread`
+(OverdueTasksReminderStory.overdueTasksNotificationTimestamp).
+Links: Asana rich text uses `/1/<domain>/project/<pot>/task/<task>` (PREFERRED_PATH); projects
+`/1/<domain>/project/<pot>`; conversations legacy `/0/<pot>/<conv>`. All notification DbObjects of loaded threads are included (not just `listThreadSize`).
 `numAdditionalThreads:50` returns 50 threads in one go. Without `objectViewId` the sub never became ready.
 
 ## Archiving

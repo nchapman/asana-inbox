@@ -608,15 +608,19 @@ class SyncClient:
         kind = obj.get("typeName")
         if obj_id and kind == "Task":
             return f"{base}/project/{project_id}/task/{obj_id}" if project_id else f"{base}/task/{obj_id}"
+        if obj_id and kind == "Pot":
+            return f"{base}/project/{obj_id}"
         if obj_id and kind == "Conversation" and project_id:
             return f"{APP}/0/{project_id}/{obj_id}"
         return f"{base}/inbox/{self.du}"
 
     def fallback_title(self, t: dict) -> str:
         obj = self.store.get("DbObject", t["object"] or "")
-        if obj.get("typeName") == "DailySummaryStory" and obj.get("date"):
-            day = datetime.fromtimestamp(int(obj["date"]) / 1000, timezone.utc).date()
-            return f"Daily summary for {day}"
+        dates = {"DailySummaryStory": ("date", "Daily summary for"),
+                 "OverdueTasksReminderStory": ("overdueTasksNotificationTimestamp", "Overdue tasks reminder for")}
+        if (d := dates.get(obj.get("typeName"))) and obj.get(d[0]):
+            day = datetime.fromtimestamp(int(obj[d[0]]) / 1000, timezone.utc).date()
+            return f"{d[1]} {day}"
         return obj.get("name") or f"({t['type']} {t['thread']})"
 
     def task_project_ids(self, task_id: str) -> list[str]:
@@ -647,26 +651,38 @@ class SyncClient:
                 groups.setdefault(parent, []).append(nid)
             for task_id, nids in groups.items():
                 notifs = [self.store.get("DbObject", n) for n in nids]
-                task = self.store.get("DbObject", task_id or "")
-                if pot:
+                parent = self.store.get("DbObject", task_id or "")
+                # What the item is about: usually the parent itself (task, conversation,
+                # project); for access requests the object access was requested to.
+                task_ref, task, prefix = task_id, parent, ""
+                if parent.get("typeName") == "RequestShareableAccess":
+                    task_ref = parent.get("target")
+                    task = self.store.get("DbObject", task_ref or "")
+                    prefix = f"Access request ({(parent.get('state') or '?').lower()}): "
+                elif parent.get("typeName") == "Pot":
+                    prefix = "Project shared: "
+                kind = task.get("typeName")
+                if kind == "Pot":
+                    project_ids = [task_ref]
+                elif pot:
                     project_ids = [pot]
-                elif task.get("typeName") == "Conversation":
-                    project_ids = conv_projects.get(task_id, [])
-                elif task_id:
-                    project_ids = self.task_project_ids(task_id)
+                elif kind == "Conversation":
+                    project_ids = conv_projects.get(task_ref, [])
+                elif kind == "Task":
+                    project_ids = self.task_project_ids(task_ref)
                 else:
                     project_ids = []
                 names = [self.store.get("DbObject", p).get("name") or p for p in project_ids]
                 # One link per project so the TUI can use the project it groups by.
-                urls = {n: self.object_url(task, task_id, p) for n, p in zip(names, project_ids)}
+                urls = {n: self.object_url(task, task_ref, p) for n, p in zip(names, project_ids)}
                 items.append({
                     "id": f"{t['thread']}/{task_id}" if task_id else t["thread"],
                     "thread": t["thread"],
                     "task_id": task_id,
-                    "url": self.object_url(task, task_id, project_ids[-1] if project_ids else None),
+                    "url": self.object_url(task, task_ref, project_ids[-1] if project_ids else None),
                     "urls": urls,
                     "type": t["type"],
-                    "title": task.get("name") or self.fallback_title(t),
+                    "title": prefix + (task.get("name") or self.fallback_title(t)),
                     # Task.completed is 0 or the completion time in ms
                     "completed": (task.get("completed") or 0) / 1000 or None,
                     "projects": names,

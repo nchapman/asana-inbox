@@ -78,6 +78,9 @@ KINDS = {
     "TaskAddedToPotNotificationThread": "added to project",
     "ConversationNotificationThread": "conversation",
     "DailySummaryNotificationThread": "daily summary",
+    "OverdueTasksReminderThread": "overdue reminder",
+    "ActionRequestNotificationThread": "access request",
+    "PotNotificationThread": "project",
 }
 
 
@@ -96,7 +99,8 @@ class WebBackend:
         useful = [p for p in projects if p not in self.ignore]
         if useful or projects:
             return (useful or projects)[-1]
-        return {"conversation": "(conversations)", "daily summary": "(daily summaries)"}.get(
+        return {"conversation": "(conversations)", "daily summary": "(daily summaries)",
+                "overdue reminder": "(overdue reminders)"}.get(
             kind, "(no project)")
 
     def list_items(self, progress=None) -> list[InboxItem]:
