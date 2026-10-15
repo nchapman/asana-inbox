@@ -1,13 +1,19 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["textual>=0.80"]
+# dependencies = ["textual>=0.80", "httpx>=0.27", "websockets>=13", "certifi"]
 # ///
-"""Bulk-archive Asana Inbox items from a TUI."""
+"""Bulk-archive Asana Inbox items from a TUI.
 
+    ./asana_inbox.py --du <domain user id> --view <inbox objectViewId>   (or env ASANA_DU / ASANA_VIEW)
+    ./asana_inbox.py --fake
+"""
+
+import argparse
+import os
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol
 
@@ -25,6 +31,7 @@ class InboxItem:
     project: str
     kind: str
     updated: datetime
+    projects: list[str] = field(default_factory=list)  # all projects; `project` is the grouping one
 
 
 class Backend(Protocol):
@@ -57,6 +64,46 @@ class FakeBackend:
     def archive(self, ids: list[str]) -> None:
         for i in ids:
             self.items.pop(i, None)
+
+
+KINDS = {
+    "TaskNotificationThread": "task",
+    "TaskAddedToPotNotificationThread": "added to project",
+    "ConversationNotificationThread": "conversation",
+    "DailySummaryNotificationThread": "daily summary",
+}
+
+
+class WebBackend:
+    """Real Asana inbox via the web app's sync protocol (asana_web.py)."""
+
+    def __init__(self, du: str, view: int | None, profile: str | None, n: int, ignore: set[str]):
+        from asana_web import WebInbox  # heavy deps only when used
+
+        self.web = WebInbox(du, view, profile, n)
+        self.ignore = ignore
+
+    def primary_project(self, projects: list[str]) -> str:
+        # Asana lists broad memberships (company goals, planning boards) first; the most
+        # specific project tends to be last.
+        useful = [p for p in projects if p not in self.ignore]
+        return (useful or projects or ["(no project)"])[-1]
+
+    def list_items(self) -> list[InboxItem]:
+        return [
+            InboxItem(
+                id=it["id"],
+                title=it["title"],
+                project=self.primary_project(it["projects"]),
+                kind=KINDS.get(it["type"], it["type"] or "?"),
+                updated=datetime.fromtimestamp(it["updated"]),
+                projects=it["projects"],
+            )
+            for it in self.web.list_items()
+        ]
+
+    def archive(self, ids: list[str]) -> None:
+        self.web.archive(ids)
 
 
 SORTS = {
@@ -132,11 +179,27 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "Project", "Title", "Kind", "Updated")
+        self.query_one(DataTable).add_columns("", "Project", "Title", "Kind", "Updated", "Also in")
         self.action_reload()
 
     def action_reload(self) -> None:
-        self.items = self.backend.list_items()
+        self.busy("loading…")
+        self.run_worker(self._load, thread=True, exclusive=True, group="backend")
+
+    def busy(self, what: str) -> None:
+        self.sub_title = what
+
+    def _load(self) -> None:  # worker thread
+        try:
+            items = self.backend.list_items()
+        except BaseException as e:  # noqa: BLE001 - show anything, don't kill the app
+            self.call_from_thread(self.notify, f"Load failed: {e}", severity="error", timeout=15)
+            self.call_from_thread(self.refresh_table)
+            return
+        self.call_from_thread(self._set_items, items)
+
+    def _set_items(self, items: list[InboxItem]) -> None:
+        self.items = items
         self.marked &= {it.id for it in self.items}
         self.refresh_table()
 
@@ -154,6 +217,7 @@ class InboxApp(App):
                 it.title,
                 it.kind,
                 it.updated.strftime("%Y-%m-%d %H:%M"),
+                ", ".join(p for p in it.projects if p != it.project)[:60],
                 key=it.id,
             )
         if cursor_id in {it.id for it in self.items}:
@@ -207,7 +271,8 @@ class InboxApp(App):
             except re.error as e:
                 self.notify(f"Bad regex: {e}", severity="error")
                 return
-            ids = {it.id for it in self.items if rx.search(f"{it.project} {it.title}")}
+            ids = {it.id for it in self.items
+                   if rx.search(f"{it.project} {it.title} {' '.join(it.projects)} {it.kind}")}
             self.marked = self.marked - ids if unmark else self.marked | ids
             self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} items")
             self.refresh_table()
@@ -223,17 +288,52 @@ class InboxApp(App):
             if not ok:
                 return
             ids = sorted(self.marked)
-            try:
-                self.backend.archive(ids)
-            except Exception as e:
-                self.notify(f"Archive failed: {e}", severity="error", timeout=10)
-                return
-            self.notify(f"Archived {len(ids)} items")
-            self.marked.clear()
-            self.action_reload()
+            self.busy(f"archiving {len(ids)}…")
+            self.run_worker(lambda: self._archive(ids), thread=True, exclusive=True, group="backend")
 
         self.push_screen(Confirm(f"Archive {len(self.marked)} marked items?"), do)
 
+    def _archive(self, ids: list[str]) -> None:  # worker thread
+        try:
+            self.backend.archive(ids)
+        except BaseException as e:  # noqa: BLE001
+            self.call_from_thread(self.notify, f"Archive failed: {e}", severity="error", timeout=15)
+            self.call_from_thread(self.refresh_table)
+            return
+
+        def done() -> None:
+            self.notify(f"Archived {len(ids)} items")
+            self.marked -= set(ids)
+            # Drop locally right away; the reload confirms against the server.
+            self.items = [it for it in self.items if it.id not in set(ids)]
+            self.refresh_table()
+            self.action_reload()
+
+        self.call_from_thread(done)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fake", action="store_true", help="use generated data, no Asana")
+    ap.add_argument("--du", default=os.environ.get("ASANA_DU"), help="domain user id (env ASANA_DU)")
+    ap.add_argument("--view", type=int, default=os.environ.get("ASANA_VIEW"),
+                    help="inbox objectViewId (env ASANA_VIEW)")
+    ap.add_argument("--profile", help="Firefox profile name or directory")
+    ap.add_argument("-n", type=int, default=50, help="threads to load")
+    ap.add_argument("--ignore-project", action="append",
+                    default=[p for p in os.environ.get("ASANA_IGNORE_PROJECTS", "").split(",") if p],
+                    help="don't group by this project if the task has others (repeatable; "
+                         "env ASANA_IGNORE_PROJECTS, comma-separated)")
+    args = ap.parse_args()
+    if args.fake:
+        backend: Backend = FakeBackend()
+    else:
+        if not args.du:
+            ap.error("--du (or ASANA_DU) is required unless --fake")
+        print("bootstrapping…")
+        backend = WebBackend(args.du, args.view, args.profile, args.n, set(args.ignore_project))
+    InboxApp(backend).run()
+
 
 if __name__ == "__main__":
-    InboxApp(FakeBackend()).run()
+    main()

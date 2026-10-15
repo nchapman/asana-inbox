@@ -55,8 +55,16 @@ The full captured param set is in `SyncClient.sub_inbox` (`asana_web.py`); which
   = oldest loaded thread (ms) and `numAdditionalThreads:0`. Pagination presumably re-subs with that
   bound + `numAdditionalThreads` — untested.
 
+Thread shapes: `TaskNotificationThread` = several notifications about one task;
+`TaskAddedToPotNotificationThread` (threadObject = Pot) = one notification per task added to that
+project, i.e. several different tasks. Also `ConversationNotificationThread`, `DailySummaryNotificationThread`
+(no storyParent task). All notification DbObjects of loaded threads are included (not just `listThreadSize`).
+`numAdditionalThreads:50` returns 50 threads in one go. Without `objectViewId` the sub never became ready.
+
 ## Archiving
 
 `/notification_set_unread_multi` with
 `endpoint_data={domain, notifications:[<notification ids of the thread>], timestamp:<ms>, unread:false}`
-plus `params.expensive_mutation=true`. Server then drops the thread from `currentDomainUserInboxThreads`.
+plus `params.expensive_mutation=true` → `{"msg":"committed","id":…,"result":null}` then `{"msg":"reflected"}`.
+Server then drops the thread from `currentDomainUserInboxThreads` (verified 2026-10-15).
+Marking only some of a thread's notifications read (one task of a Pot thread) — untested.

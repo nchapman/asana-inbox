@@ -8,7 +8,8 @@
 Read-only spike:
     ./asana_web.py cookies [--profile NAME|PATH]       # check Firefox auth (prints names only)
     ./asana_web.py bootstrap [--profile ...]           # release, bundle version, start_session, id candidates
-    ./asana_web.py inbox --du ID [--shard N] [--dump frames.jsonl]
+    ./asana_web.py inbox --du ID [--view ID] [-n 50] [--dump frames.jsonl]
+    ./asana_web.py archive --du ID THREAD_ID... [--yes]   # dry run without --yes
 
 Env: ASANA_UA (User-Agent override), ASANA_FF_CONTAINER (Firefox container id),
      ASANA_DOMAIN (workspace gid; default: last_domain cookie).
@@ -38,6 +39,12 @@ APP = "https://app.asana.com"
 WS_HOST = "cdn.sync.app.asana.com"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "asana-inbox"
+
+
+
+class AsanaError(RuntimeError):
+    """Expected failure with a human-readable message (auth, HTTP, protocol)."""
+
 
 # ---------------------------------------------------------------- Firefox cookies
 
@@ -78,14 +85,14 @@ def find_profile(spec: str | None) -> Path:
                 return resolve(sec)
         if profiles:
             return resolve(next(iter(profiles.values())))
-    raise SystemExit(f"No Firefox profile found (spec={spec!r}); pass --profile PATH")
+    raise AsanaError(f"No Firefox profile found (spec={spec!r}); pass --profile PATH")
 
 
 def cookie_rows(profile: Path) -> list[dict]:
     """All unexpired *.asana.com cookies. Copies the DB since Firefox locks it."""
     src = profile / "cookies.sqlite"
     if not src.exists():
-        raise SystemExit(f"{src} not found")
+        raise AsanaError(f"{src} not found")
     with tempfile.TemporaryDirectory() as tmp:
         for suffix in ("", "-wal", "-shm"):
             if (p := Path(f"{src}{suffix}")).exists():
@@ -157,7 +164,7 @@ class Session:
         jar = dict(p.split("=", 1) for p in cookie_header(cookies, "app.asana.com").split("; ") if "=" in p)
         missing = [k for k in ("ticket", "user", "last_domain") if k not in jar]
         if missing:
-            raise SystemExit(f"cookies missing {missing}; log in to Asana in Firefox")
+            raise AsanaError(f"cookies missing {missing}; log in to Asana in Firefox")
         self.ticket = jar["ticket"]          # CSRF token, echoed as X-Asana-Ticket
         self.user_id = jar["user"]           # user gid
         self.domain = os.environ.get("ASANA_DOMAIN", jar["last_domain"])  # workspace gid == shard_id
@@ -181,7 +188,7 @@ class Session:
             hdrs = "\n".join(f"    {k}: {show(k, v)}" for k, v in r.headers.multi_items()
                              if any(k.lower().startswith(p) for p in interesting))
             body = re.sub(r"\s+", " ", r.text)[:600]
-            raise SystemExit(f"{r.status_code} {r.reason_phrase} for {url}\n"
+            raise AsanaError(f"{r.status_code} {r.reason_phrase} for {url}\n"
                              f"  headers:\n{hdrs}\n  body: {body}")
         return r
 
@@ -295,6 +302,7 @@ class SyncClient:
         }
         # uv's standalone Python doesn't see system CAs; use certifi like httpx does.
         ctx = ssl.create_default_context(cafile=certifi.where())
+        self.session_id = session_id
         self.ws = await websockets.connect(url, additional_headers=headers, max_size=None, ssl=ctx)
         await self.send({
             "msg": "connect", "session": session_id, "projectionBundleVersion": bundle_version,
@@ -327,6 +335,26 @@ class SyncClient:
                     if pred(msg):
                         return msg
 
+    async def mutate(self, method: str, endpoint_data: dict, timeout: float = 30, **extra) -> dict:
+        self.next_id += 1
+        mid = str(self.next_id)
+        await self.send({
+            "msg": "mutation", "method": method, "id": mid,
+            "params": {"http_method": "post", **extra, "endpoint_data": {
+                **endpoint_data, "__app_name": "asana", "__session_id": self.session_id}},
+        })
+        return await self.wait_for(lambda m: m.get("msg") == "committed" and str(m.get("id")) == mid,
+                                   timeout)
+
+    async def archive_threads(self, threads: list[dict]) -> None:
+        """Mark the notifications of the given threads/items read, which archives them."""
+        notifs = [n for t in threads for n in t["notifications"]]
+        if notifs:
+            await self.mutate("/notification_set_unread_multi", {
+                "domain": self.shard, "notifications": notifs,
+                "timestamp": int(time.time() * 1000), "unread": False,
+            }, expensive_mutation=True)
+
     async def sub(self, name: str, params: dict, timeout: float = 30) -> None:
         self.next_id += 1
         sid = str(self.next_id)
@@ -337,8 +365,11 @@ class SyncClient:
             "behavior": {"deferInvalidationReloadsWhenHidden": True, "shouldDebugTrace": False},
         })
         # Server also reports its own internal subs (id "-1"); wait for ours to be ready.
-        await self.wait_for(lambda m: m.get("msg") == "subscription_state" and str(m.get("id")) == sid
-                            and m.get("state") == "ready", timeout)
+        try:
+            await self.wait_for(lambda m: m.get("msg") == "subscription_state" and str(m.get("id")) == sid
+                                and m.get("state") == "ready", timeout)
+        except TimeoutError:
+            raise AsanaError(f"sub {name} not ready after {timeout}s") from None
 
     async def sub_inbox(self, num_threads: int = 5, view_id: int | None = None) -> None:
         """Params copied verbatim from the web app (2026-10-15); not yet minimised."""
@@ -390,7 +421,7 @@ class SyncClient:
             "paginatedTeamMembershipsRangeForCollaboratorRecommendation": rng(2),
             "shareable": {"shareableId": -1},
             "teamComputedMembershipForShareableParams": {"shareableId": -1},
-        })
+        }, timeout=90)
 
     def inbox_threads(self) -> list[dict]:
         order = []
@@ -410,6 +441,7 @@ class SyncClient:
                 project_ids = self.store.get("ServerComputedValue", key).get("value") or []
             projects = [self.store.get("DbObject", p).get("name") or p for p in project_ids]
             threads.append({
+                "thread": t.get("notificationThread") or tid,
                 "projects": projects,
                 "id": tid,
                 "type": t.get("threadTypeName"),
@@ -422,11 +454,91 @@ class SyncClient:
             })
         return threads
 
+    def task_projects(self, task_id: str) -> list[str]:
+        key = json.dumps(["taskProjectsContainingThis", task_id, {}], separators=(",", ":"))
+        ids = self.store.get("ServerComputedValue", key).get("value") or []
+        return [self.store.get("DbObject", p).get("name") or p for p in ids]
+
+    def inbox_items(self) -> list[dict]:
+        """One item per (thread, task): a project thread ("task added to X") bundles several
+        tasks, each archivable on its own. Item id is "<thread>/<task>" (or "<thread>" if no task)."""
+        items = []
+        for t in self.inbox_threads():
+            pot = t["object"] if t["object_type"] == "Pot" else None
+            groups: dict[str | None, list[str]] = {}
+            for nid in t["notifications"]:
+                n = self.store.get("DbObject", nid)
+                groups.setdefault(n.get("storyParent"), []).append(nid)
+            for task_id, nids in groups.items():
+                notifs = [self.store.get("DbObject", n) for n in nids]
+                task = self.store.get("DbObject", task_id or "")
+                if pot:
+                    projects = [self.store.get("DbObject", pot).get("name") or pot]
+                elif task_id:
+                    projects = self.task_projects(task_id)
+                else:
+                    projects = []
+                items.append({
+                    "id": f"{t['thread']}/{task_id}" if task_id else t["thread"],
+                    "thread": t["thread"],
+                    "task_id": task_id,
+                    "type": t["type"],
+                    "title": task.get("name") or t["task"] or f"({t['type']} {t['thread']})",
+                    "projects": projects,
+                    "notifications": nids,
+                    "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
+                })
+        return items
+
     async def close(self) -> None:
         if self.ws:
             await self.ws.close()
         if self.dump:
             self.dump.close()
+
+
+# ---------------------------------------------------------------- blocking facade
+
+
+class WebInbox:
+    """Blocking wrapper for the TUI. Each call opens a fresh websocket (run it in a worker
+    thread); HTTP bootstrap (release, bundle version) is done once and reused."""
+
+    def __init__(self, du: str, view: int | None, profile: str | None = None, n: int = 50):
+        self.du, self.view, self.n = du, view, n
+        self.sess = Session(find_profile(profile))
+        self.rev, bundle = self.sess.release_info()
+        self.ver = self.sess.bundle_version(bundle)
+        self.notifications: dict[str, list[str]] = {}  # item id -> notification ids
+
+    async def _client(self) -> SyncClient:
+        ss = self.sess.start_session(self.rev, f"/1/{self.sess.domain}/inbox/{self.du}")
+        client = SyncClient(self.sess, self.du, self.sess.domain)
+        await client.connect(ss["session_id"], self.ver, self.rev)
+        return client
+
+    async def _list(self) -> list[dict]:
+        client = await self._client()
+        try:
+            await client.sub_inbox(self.n, self.view)
+            return client.inbox_items()
+        finally:
+            await client.close()
+
+    async def _archive(self, ids: list[str]) -> None:
+        client = await self._client()
+        try:
+            await client.archive_threads([{"notifications": self.notifications[i]} for i in ids])
+        finally:
+            await client.close()
+
+    def list_items(self) -> list[dict]:
+        items = asyncio.run(self._list())
+        self.notifications = {it["id"]: it["notifications"] for it in items}
+        return items
+
+    def archive(self, ids: list[str]) -> None:
+        asyncio.run(self._archive(ids))
 
 
 # ---------------------------------------------------------------- CLI
@@ -465,26 +577,80 @@ def cmd_bootstrap(args) -> None:
         print(f"  {p} = {v!r}"[:200])
 
 
-async def cmd_inbox(args) -> None:
+def print_items(items: list[dict]) -> None:
+    """Items grouped under their thread; ids are what `archive` takes."""
+    by_thread: dict[str, list[dict]] = {}
+    for it in items:
+        by_thread.setdefault(it["thread"], []).append(it)
+    for thread, its in by_thread.items():
+        if len(its) > 1:
+            print(f"{thread}  {its[0]['type']}  ({len(its)} tasks)")
+        for it in its:
+            indent = "  " if len(its) > 1 else ""
+            print(f"{indent}{it['id']:<34} n={len(it['notifications']):<2} {it['title']}")
+            print(f"{indent}{'':34}      projects: {', '.join(it['projects']) or '-'}")
+
+
+async def open_inbox(args) -> tuple[SyncClient, list[dict]]:
     sess = Session(find_profile(args.profile))
     rev, bundle = sess.release_info()
     ver = sess.bundle_version(bundle)
     ss = sess.start_session(rev, f"/1/{sess.domain}/inbox/{args.du}")
     client = SyncClient(sess, args.du, args.shard or sess.domain,
                         Path(args.dump) if args.dump else None)
+    await client.connect(ss["session_id"], ver, rev)
+    print("connected", file=sys.stderr)
+    await client.sub_inbox(args.n, args.view)
+    return client, client.inbox_threads()
+
+
+async def drain(client: SyncClient, seconds: float) -> None:
+    """Keep applying server pushes for a while (no-op pred)."""
     try:
-        await client.connect(ss["session_id"], ver, rev)
-        print("connected", file=sys.stderr)
-        await client.sub_inbox(args.n, args.view)
-        threads = client.inbox_threads()
-        colls = {}
-        for c, _ in client.store.docs:
-            colls[c] = colls.get(c, 0) + 1
-        print(f"docs per collection: {colls}", file=sys.stderr)
-        for t in threads:
-            print(f"{t['type'] or '?':32} n={len(t['notifications']):<2} unread={t['unread']:<2} "
-                  f"{t['task'] or t['object']}\n{'':40}projects: {', '.join(t['projects']) or '-'}")
-        print(f"{len(threads)} threads", file=sys.stderr)
+        await client.wait_for(lambda m: False, seconds)
+    except TimeoutError:
+        pass
+
+
+async def cmd_inbox(args) -> None:
+    client, threads = await open_inbox(args)
+    try:
+        items = client.inbox_items()
+        print_items(items)
+        print(f"{len(items)} items in {len(threads)} threads", file=sys.stderr)
+    finally:
+        await client.close()
+
+
+async def cmd_archive(args) -> None:
+    """Archive items ("<thread>/<task>") or whole threads ("<thread>")."""
+    client, _ = await open_inbox(args)
+    try:
+        items = client.inbox_items()
+        wanted = set(args.id)
+        chosen = [it for it in items if it["id"] in wanted or it["thread"] in wanted]
+        found = {it["id"] for it in chosen} | {it["thread"] for it in chosen}
+        if missing := wanted - found:
+            print(f"not among the {len(items)} loaded items (raise -n?): {sorted(missing)}",
+                  file=sys.stderr)
+        print_items(chosen)
+        if not chosen:
+            return
+        if not args.yes:
+            print(f"dry run: would mark {sum(len(it['notifications']) for it in chosen)} notifications "
+                  "read for the items above; pass --yes to archive", file=sys.stderr)
+            return
+        await client.archive_threads(chosen)
+        print("committed", file=sys.stderr)
+        await drain(client, 3)
+        chosen_ids = {it["id"] for it in chosen}
+        remaining = client.inbox_items()
+        still = chosen_ids & {it["id"] for it in remaining}
+        print("still listed after archive: " + (", ".join(sorted(still)) or "none"), file=sys.stderr)
+        siblings = [it for it in remaining if it["thread"] in {c["thread"] for c in chosen}]
+        if siblings:
+            print("other items left in the same thread(s):", file=sys.stderr)
+            print_items(siblings)
     finally:
         await client.close()
 
@@ -495,20 +661,31 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("cookies")
     sub.add_parser("bootstrap")
-    p = sub.add_parser("inbox")
-    p.add_argument("--du", required=True, help="domain user id (in the web inbox URL /1/<domain>/inbox/<du>)")
-    p.add_argument("--shard", help="shardId (default: domain id)")
-    p.add_argument("-n", type=int, default=5, help="numAdditionalThreads")
-    p.add_argument("--view", type=int, help="inbox objectViewId (from the web app's inbox sub)")
-    p.add_argument("--dump", help="append raw frames as JSONL (contains internal data; don't commit)")
+    inbox = sub.add_parser("inbox", help="list threads")
+    arch = sub.add_parser("archive", help="archive items/threads by id (dry run unless --yes)")
+    arch.add_argument("id", nargs="+", help="item id <thread>/<task>, or a thread id for the whole thread")
+    arch.add_argument("--yes", action="store_true", help="actually archive")
+    for p in (inbox, arch):
+        p.add_argument("--du", default=os.environ.get("ASANA_DU"), required="ASANA_DU" not in os.environ,
+                       help="domain user id (web inbox URL /1/<domain>/inbox/<du>; env ASANA_DU)")
+        p.add_argument("--shard", help="shardId (default: domain id)")
+        p.add_argument("-n", type=int, default=50, help="numAdditionalThreads")
+        p.add_argument("--view", type=int, default=os.environ.get("ASANA_VIEW"),
+                       help="inbox objectViewId (env ASANA_VIEW)")
+        p.add_argument("--dump", help="append raw frames as JSONL (contains internal data; don't commit)")
     args = ap.parse_args()
     if args.cmd == "cookies":
         cmd_cookies(args)
     elif args.cmd == "bootstrap":
         cmd_bootstrap(args)
-    else:
+    elif args.cmd == "inbox":
         asyncio.run(cmd_inbox(args))
+    else:
+        asyncio.run(cmd_archive(args))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except AsanaError as e:
+        sys.exit(str(e))
