@@ -36,6 +36,7 @@ class InboxItem:
     updated: datetime
     projects: list[str] = field(default_factory=list)  # all projects; `project` is the grouping one
     completed: datetime | None = None
+    url: str = ""
 
 
 class Backend(Protocol):
@@ -59,6 +60,7 @@ class FakeBackend:
                 kind=rnd.choice(kinds),
                 updated=now - timedelta(hours=rnd.randint(1, 24 * 60)),
                 completed=now if rnd.random() < 0.2 else None,
+                url=f"https://app.asana.com/1/0/task/{1000 + i}",
             )
             for i in range(n)
         }
@@ -98,18 +100,20 @@ class WebBackend:
             kind, "(no project)")
 
     def list_items(self, progress=None) -> list[InboxItem]:
-        return [
-            InboxItem(
+        items = []
+        for it in self.web.list_items(progress):
+            project = self.primary_project(it["projects"], KINDS.get(it["type"], ""))
+            items.append(InboxItem(
                 id=it["id"],
                 title=it["title"],
-                project=self.primary_project(it["projects"], KINDS.get(it["type"], "")),
+                project=project,
                 kind=KINDS.get(it["type"], it["type"] or "?"),
                 updated=datetime.fromtimestamp(it["updated"]),
                 projects=it["projects"],
                 completed=datetime.fromtimestamp(it["completed"]) if it.get("completed") else None,
-            )
-            for it in self.web.list_items(progress)
-        ]
+                url=it.get("urls", {}).get(project) or it.get("url", ""),
+            ))
+        return items
 
     def archive(self, ids: list[str]) -> None:
         self.web.archive(ids)
@@ -179,6 +183,7 @@ class InboxApp(App):
         Binding("c", "toggle_completed", "Mark completed"),
         Binding("a", "toggle_all", "All/none"),
         Binding("s", "cycle_sort", "Sort"),
+        Binding("y", "copy_url", "Copy URL"),
         Binding("x", "archive", "Archive marked"),
         Binding("r", "reload", "Reload"),
         Binding("q", "quit", "Quit"),
@@ -289,6 +294,16 @@ class InboxApp(App):
         ids = {it.id for it in self.visible() if it.project == cur.project}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
         self.refresh_table()
+
+    def action_copy_url(self) -> None:
+        """Copy the selected item's Asana link via OSC 52 (terminal clipboard escape).
+        In tmux this needs `set -g set-clipboard on`."""
+        cur = self.current_item()
+        if cur is None or not cur.url:
+            self.notify("No URL for this item", severity="warning")
+            return
+        self.copy_to_clipboard(cur.url)
+        self.notify(f"Copied {cur.url}")
 
     def action_toggle_completed(self) -> None:
         ids = {it.id for it in self.visible() if it.completed}

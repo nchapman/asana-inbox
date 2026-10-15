@@ -600,6 +600,18 @@ class SyncClient:
             })
         return threads
 
+    def object_url(self, obj: dict, obj_id: str | None, project_id: str | None) -> str:
+        """Link for a task/conversation, as seen in Asana rich text (PREFERRED_PATH):
+        /1/<domain>/project/<project>/task/<task>. Conversations use the legacy
+        /0/<project>/<id> form (redirected by Asana; untested). No object: the inbox."""
+        base = f"{APP}/1/{self.shard}"
+        kind = obj.get("typeName")
+        if obj_id and kind == "Task":
+            return f"{base}/project/{project_id}/task/{obj_id}" if project_id else f"{base}/task/{obj_id}"
+        if obj_id and kind == "Conversation" and project_id:
+            return f"{APP}/0/{project_id}/{obj_id}"
+        return f"{base}/inbox/{self.du}"
+
     def fallback_title(self, t: dict) -> str:
         obj = self.store.get("DbObject", t["object"] or "")
         if obj.get("typeName") == "DailySummaryStory" and obj.get("date"):
@@ -607,15 +619,24 @@ class SyncClient:
             return f"Daily summary for {day}"
         return obj.get("name") or f"({t['type']} {t['thread']})"
 
-    def task_projects(self, task_id: str) -> list[str]:
+    def task_project_ids(self, task_id: str) -> list[str]:
         key = json.dumps(["taskProjectsContainingThis", task_id, {}], separators=(",", ":"))
-        ids = self.store.get("ServerComputedValue", key).get("value") or []
-        return [self.store.get("DbObject", p).get("name") or p for p in ids]
+        return list(self.store.get("ServerComputedValue", key).get("value") or [])
+
+    def conversation_project_ids(self) -> dict[str, list[str]]:
+        """Conversation id -> project ids, from Rank docs "Conversation.projectFollowers.<conv>.<pot>"."""
+        out: dict[str, list[str]] = {}
+        for coll, id_ in self.store.docs:
+            if coll == "Rank" and id_.startswith("Conversation.projectFollowers."):
+                conv, pot = id_.split(".")[2:4]
+                out.setdefault(conv, []).append(pot)
+        return out
 
     def inbox_items(self) -> list[dict]:
         """One item per (thread, task): a project thread ("task added to X") bundles several
         tasks, each archivable on its own. Item id is "<thread>/<task>" (or "<thread>" if no task)."""
         items = []
+        conv_projects = self.conversation_project_ids()
         for t in self.inbox_threads():
             pot = t["object"] if t["object_type"] == "Pot" else None
             groups: dict[str | None, list[str]] = {}
@@ -628,21 +649,27 @@ class SyncClient:
                 notifs = [self.store.get("DbObject", n) for n in nids]
                 task = self.store.get("DbObject", task_id or "")
                 if pot:
-                    projects = [self.store.get("DbObject", pot).get("name") or pot]
+                    project_ids = [pot]
+                elif task.get("typeName") == "Conversation":
+                    project_ids = conv_projects.get(task_id, [])
                 elif task_id:
-                    projects = self.task_projects(task_id)
+                    project_ids = self.task_project_ids(task_id)
                 else:
-                    projects = []
+                    project_ids = []
+                names = [self.store.get("DbObject", p).get("name") or p for p in project_ids]
+                # One link per project so the TUI can use the project it groups by.
+                urls = {n: self.object_url(task, task_id, p) for n, p in zip(names, project_ids)}
                 items.append({
                     "id": f"{t['thread']}/{task_id}" if task_id else t["thread"],
                     "thread": t["thread"],
                     "task_id": task_id,
-                    "url": self.item_url(task, task_id, t),
+                    "url": self.object_url(task, task_id, project_ids[-1] if project_ids else None),
+                    "urls": urls,
                     "type": t["type"],
                     "title": task.get("name") or self.fallback_title(t),
                     # Task.completed is 0 or the completion time in ms
                     "completed": (task.get("completed") or 0) / 1000 or None,
-                    "projects": projects,
+                    "projects": names,
                     "notifications": nids,
                     "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
                 })
