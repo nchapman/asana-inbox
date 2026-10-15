@@ -23,7 +23,7 @@ from typing import Protocol
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
@@ -239,17 +239,33 @@ class Detail(ModalScreen[None]):
 
 
 class Confirm(ModalScreen[bool]):
-    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel")]
+    # Enter confirms (Archive has focus); Tab to Cancel; arrows/PgUp/PgDn scroll the list.
+    AUTO_FOCUS = "#yes"
+    BINDINGS = [
+        Binding("escape", "dismiss(False)", "Cancel"),
+        Binding("up", "scroll('scroll_up')", show=False),
+        Binding("down", "scroll('scroll_down')", show=False),
+        Binding("pageup", "scroll('scroll_page_up')", show=False),
+        Binding("pagedown", "scroll('scroll_page_down')", show=False),
+    ]
 
-    def __init__(self, message: str):
+    def action_scroll(self, how: str) -> None:
+        for lst in self.query("#confirm-list"):
+            getattr(lst, how)(animate=False)
+
+    def __init__(self, message: str, details: Text | None = None):
         super().__init__()
-        self.message = message
+        self.message, self.details = message, details
 
     def compose(self) -> ComposeResult:
-        with Grid(id="confirm"):
-            yield Label(self.message)
-            yield Button("Archive", variant="error", id="yes")
-            yield Button("Cancel", id="no")
+        with Vertical(id="confirm"):
+            yield Label(self.message, id="confirm-msg")
+            if self.details is not None:
+                with VerticalScroll(id="confirm-list", can_focus=False):
+                    yield Static(self.details)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Archive", variant="error", id="yes")
+                yield Button("Cancel", id="no")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "yes")
@@ -260,9 +276,12 @@ class InboxApp(App):
     RegexPrompt, Confirm, Detail { align: center middle; }
     #detail { width: 90%; height: 90%; border: thick $accent; background: $surface; padding: 0 1; }
     RegexPrompt Input { width: 70%; }
-    #confirm { grid-size: 2; grid-rows: auto auto; width: 60; height: auto; padding: 1 2;
+    #confirm { width: 90%; max-width: 120; height: auto; max-height: 90%; padding: 1 2;
                border: thick $error; background: $surface; }
-    #confirm Label { column-span: 2; width: 100%; margin-bottom: 1; }
+    #confirm-msg { width: 100%; text-style: bold; margin-bottom: 1; }
+    #confirm-list { height: auto; max-height: 60vh; margin-bottom: 1; }
+    #confirm-buttons { height: auto; width: 100%; }
+    #confirm-buttons Button { margin-right: 2; }
     """
     BINDINGS = [
         Binding("space", "toggle", "Mark"),
@@ -514,9 +533,19 @@ class InboxApp(App):
             self.busy(f"archiving {len(ids)}…")
             self.run_worker(lambda: self._archive(ids), thread=True, exclusive=True, group="backend")
 
-        hidden = len(self.marked - {it.id for it in self.visible()})
-        note = f"\n({hidden} of them are hidden by the filter)" if hidden else ""
-        self.push_screen(Confirm(f"Archive {len(self.marked)} marked items?{note}"), do)
+        shown_ids = {it.id for it in self.visible()}
+        marked = sorted((it for it in self.items if it.id in self.marked), key=SORTS[self.sort])
+        hidden = sum(1 for it in marked if it.id not in shown_ids)
+        details = Text()
+        for it in marked:
+            details.append(f"{it.project}  ", style="dim")
+            details.append(it.title)
+            if it.id not in shown_ids:
+                details.append("  (hidden by filter)", style="italic yellow")
+            details.append("\n")
+        details.rstrip()
+        note = f" ({hidden} hidden by the filter)" if hidden else ""
+        self.push_screen(Confirm(f"Archive these {len(marked)} items?{note}", details), do)
 
     def _archive(self, ids: list[str]) -> None:  # worker thread
         try:
