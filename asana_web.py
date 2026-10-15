@@ -359,21 +359,32 @@ class SyncClient:
     async def load_inbox(self, n: int, view_id: int | None, log=None) -> int:
         """n > 0: load n threads. n == 0: load everything by doubling the request until the
         server returns fewer threads than asked. Returns the number of threads loaded."""
+        log = log or (lambda s: None)
         if n > 0:
             await self.sub_inbox(n, view_id)
             return len(self.inbox_threads())
-        n, got = 100, 0
+        # Each step reloads from scratch, so start big and grow fast.
+        n, got = int(os.environ.get("ASANA_FIRST_BATCH", 250)), 0
         while True:
-            await self.sub_inbox(n, view_id)
+            log(f"loading up to {n} threads…")
+            t0 = time.monotonic()
+            try:
+                await self.sub_inbox(n, view_id)
+            except AsanaError as e:
+                if not got:
+                    raise
+                # Earlier, smaller sub's docs are still in the store; keep them.
+                log(f"{e}; showing the {got} threads loaded so far")
+                return got
             prev, got = got, len(self.inbox_threads())
-            if log:
-                log(f"asked {n} threads, got {got}")
+            log(f"asked {n} threads, got {got} ({time.monotonic() - t0:.1f}s)")
             if got < n:
                 return got
             if got <= prev:  # server stopped growing: probably a cap on numAdditionalThreads
                 raise AsanaError(f"inbox stuck at {got} threads; server may cap numAdditionalThreads")
-            await self.send({"msg": "unsub", "id": str(self.next_id)})
-            n *= 2
+            # Previous sub stays open on purpose: unsubscribing could make the server remove its
+            # docs, losing the fallback if the next, bigger sub times out. Connection is short-lived.
+            n *= 4
 
     async def sub(self, name: str, params: dict, timeout: float = 30) -> None:
         self.next_id += 1
@@ -441,7 +452,7 @@ class SyncClient:
             "paginatedTeamMembershipsRangeForCollaboratorRecommendation": rng(2),
             "shareable": {"shareableId": -1},
             "teamComputedMembershipForShareableParams": {"shareableId": -1},
-        }, timeout=90)
+        }, timeout=max(90.0, 0.15 * num_threads))
 
     def inbox_threads(self) -> list[dict]:
         # One value per inbox sub (keyed by its params); after load_all re-subs, take the longest.
@@ -550,10 +561,10 @@ class WebInbox:
         await client.connect(ss["session_id"], self.ver, self.rev)
         return client
 
-    async def _list(self) -> list[dict]:
+    async def _list(self, log) -> list[dict]:
         client = await self._client()
         try:
-            await client.load_inbox(self.n, self.view)
+            await client.load_inbox(self.n, self.view, log)
             return client.inbox_items()
         finally:
             await client.close()
@@ -565,8 +576,8 @@ class WebInbox:
         finally:
             await client.close()
 
-    def list_items(self) -> list[dict]:
-        items = asyncio.run(self._list())
+    def list_items(self, log=None) -> list[dict]:
+        items = asyncio.run(self._list(log))
         self.notifications = {it["id"]: it["notifications"] for it in items}
         return items
 

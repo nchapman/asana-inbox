@@ -36,7 +36,7 @@ class InboxItem:
 
 
 class Backend(Protocol):
-    def list_items(self) -> list[InboxItem]: ...
+    def list_items(self, progress=None) -> list[InboxItem]: ...
     def archive(self, ids: list[str]) -> None: ...
 
 
@@ -60,7 +60,7 @@ class FakeBackend:
             for i in range(n)
         }
 
-    def list_items(self) -> list[InboxItem]:
+    def list_items(self, progress=None) -> list[InboxItem]:
         return list(self.items.values())
 
     def archive(self, ids: list[str]) -> None:
@@ -94,7 +94,7 @@ class WebBackend:
         return {"conversation": "(conversations)", "daily summary": "(daily summaries)"}.get(
             kind, "(no project)")
 
-    def list_items(self) -> list[InboxItem]:
+    def list_items(self, progress=None) -> list[InboxItem]:
         return [
             InboxItem(
                 id=it["id"],
@@ -105,7 +105,7 @@ class WebBackend:
                 projects=it["projects"],
                 completed=datetime.fromtimestamp(it["completed"]) if it.get("completed") else None,
             )
-            for it in self.web.list_items()
+            for it in self.web.list_items(progress)
         ]
 
     def archive(self, ids: list[str]) -> None:
@@ -120,19 +120,25 @@ SORTS = {
 }
 
 
-class RegexPrompt(ModalScreen[tuple[str, bool] | None]):
-    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+class RegexPrompt(ModalScreen[tuple[str, str] | None]):
+    """Ask for a regex; returns (pattern, mode) where mode is "mark", "unmark" or "filter"."""
 
-    def __init__(self, unmark: bool):
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+    PLACEHOLDERS = {
+        "mark": "Mark shown items matching regex (project, title, other projects, kind, 'done')",
+        "unmark": "Unmark shown items matching regex",
+        "filter": "Show only items matching regex (empty = show all)",
+    }
+
+    def __init__(self, mode: str, value: str = ""):
         super().__init__()
-        self.unmark = unmark
+        self.mode, self.value = mode, value
 
     def compose(self) -> ComposeResult:
-        verb = "Unmark" if self.unmark else "Mark"
-        yield Input(placeholder=f"{verb} items whose project/title match regex")
+        yield Input(value=self.value, placeholder=self.PLACEHOLDERS[self.mode])
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss((event.value, self.unmark))
+        self.dismiss((event.value, self.mode))
 
 
 class Confirm(ModalScreen[bool]):
@@ -162,8 +168,10 @@ class InboxApp(App):
     """
     BINDINGS = [
         Binding("space", "toggle", "Mark"),
-        Binding("slash", "regex(False)", "Mark /re/"),
-        Binding("backslash", "regex(True)", "Unmark /re/"),
+        Binding("f", "filter", "Filter"),
+        Binding("escape", "clear_filter", "Clear filter", show=False),
+        Binding("slash", "regex('mark')", "Mark /re/"),
+        Binding("backslash", "regex('unmark')", "Unmark /re/"),
         Binding("p", "toggle_project", "Mark project"),
         Binding("c", "toggle_completed", "Mark completed"),
         Binding("a", "toggle_all", "All/none"),
@@ -179,6 +187,18 @@ class InboxApp(App):
         self.items: list[InboxItem] = []
         self.marked: set[str] = set()
         self.sort = "project"
+        self.filter: re.Pattern | None = None
+
+    @staticmethod
+    def match_text(it: InboxItem) -> str:
+        done = "done" if it.completed else ""
+        return f"{it.project} {it.title} {' '.join(it.projects)} {it.kind} {done}"
+
+    def visible(self) -> list[InboxItem]:
+        """Items passing the filter; every bulk mark action works on these only."""
+        if self.filter is None:
+            return self.items
+        return [it for it in self.items if self.filter.search(self.match_text(it))]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -198,7 +218,7 @@ class InboxApp(App):
 
     def _load(self) -> None:  # worker thread
         try:
-            items = self.backend.list_items()
+            items = self.backend.list_items(lambda s: self.call_from_thread(self.busy, s))
         except BaseException as e:  # noqa: BLE001 - show anything, don't kill the app
             self.call_from_thread(self.notify, f"Load failed: {e}", severity="error", timeout=15)
             self.call_from_thread(self.refresh_table)
@@ -215,7 +235,8 @@ class InboxApp(App):
         cursor_id = self.current_id()
         table.clear()
         prev_project = None
-        for it in sorted(self.items, key=SORTS[self.sort]):
+        shown = self.visible()
+        for it in sorted(shown, key=SORTS[self.sort]):
             project = it.project if self.sort != "project" or it.project != prev_project else ""
             prev_project = it.project
             table.add_row(
@@ -228,10 +249,17 @@ class InboxApp(App):
                 ", ".join(p for p in it.projects if p != it.project)[:60],
                 key=it.id,
             )
-        if cursor_id in {it.id for it in self.items}:
+        if cursor_id in {it.id for it in shown}:
             table.move_cursor(row=table.get_row_index(cursor_id))
         self.title = "Asana Inbox"
-        self.sub_title = f"{len(self.items)} items · {len(self.marked)} marked · sort: {self.sort}"
+        parts = [f"{len(self.items)} items", f"{len(self.marked)} marked", f"sort: {self.sort}"]
+        if self.filter is not None:
+            hidden_marked = len(self.marked - {it.id for it in shown})
+            parts[0] = f"{len(shown)}/{len(self.items)} shown"
+            parts.append(f"filter: /{self.filter.pattern}/")
+            if hidden_marked:
+                parts[1] += f" ({hidden_marked} hidden)"
+        self.sub_title = " · ".join(parts)
 
     def current_id(self) -> str | None:
         table = self.query_one(DataTable)
@@ -255,14 +283,14 @@ class InboxApp(App):
         cur = self.current_item()
         if cur is None:
             return
-        ids = {it.id for it in self.items if it.project == cur.project}
+        ids = {it.id for it in self.visible() if it.project == cur.project}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
         self.refresh_table()
 
     def action_toggle_completed(self) -> None:
-        ids = {it.id for it in self.items if it.completed}
+        ids = {it.id for it in self.visible() if it.completed}
         if not ids:
-            self.notify("No completed tasks in the inbox")
+            self.notify("No completed tasks shown")
             return
         unmark = ids <= self.marked
         self.marked = self.marked - ids if unmark else self.marked | ids
@@ -270,8 +298,8 @@ class InboxApp(App):
         self.refresh_table()
 
     def action_toggle_all(self) -> None:
-        all_ids = {it.id for it in self.items}
-        self.marked = set() if self.marked == all_ids else all_ids
+        ids = {it.id for it in self.visible()}
+        self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
         self.refresh_table()
 
     def action_cycle_sort(self) -> None:
@@ -279,23 +307,40 @@ class InboxApp(App):
         self.sort = keys[(keys.index(self.sort) + 1) % len(keys)]
         self.refresh_table()
 
-    def action_regex(self, unmark: bool) -> None:
-        def apply(result: tuple[str, bool] | None) -> None:
-            if not result or not result[0]:
+    def action_regex(self, mode: str) -> None:
+        def apply(result: tuple[str, str] | None) -> None:
+            if result is None:
                 return
-            pattern, unmark = result
+            pattern, mode = result
+            if mode == "filter" and not pattern:
+                self.action_clear_filter()
+                return
+            if not pattern:
+                return
             try:
                 rx = re.compile(pattern, re.IGNORECASE)
             except re.error as e:
                 self.notify(f"Bad regex: {e}", severity="error")
                 return
-            ids = {it.id for it in self.items
-                   if rx.search(f"{it.project} {it.title} {' '.join(it.projects)} {it.kind}")}
-            self.marked = self.marked - ids if unmark else self.marked | ids
-            self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} items")
+            if mode == "filter":
+                self.filter = rx
+            else:
+                ids = {it.id for it in self.visible() if rx.search(self.match_text(it))}
+                unmark = mode == "unmark"
+                self.marked = self.marked - ids if unmark else self.marked | ids
+                self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} items")
             self.refresh_table()
 
-        self.push_screen(RegexPrompt(unmark), apply)
+        current = self.filter.pattern if mode == "filter" and self.filter is not None else ""
+        self.push_screen(RegexPrompt(mode, current), apply)
+
+    def action_filter(self) -> None:
+        self.action_regex("filter")
+
+    def action_clear_filter(self) -> None:
+        if self.filter is not None:
+            self.filter = None
+            self.refresh_table()
 
     def action_archive(self) -> None:
         if not self.marked:
@@ -309,7 +354,9 @@ class InboxApp(App):
             self.busy(f"archiving {len(ids)}…")
             self.run_worker(lambda: self._archive(ids), thread=True, exclusive=True, group="backend")
 
-        self.push_screen(Confirm(f"Archive {len(self.marked)} marked items?"), do)
+        hidden = len(self.marked - {it.id for it in self.visible()})
+        note = f"\n({hidden} of them are hidden by the filter)" if hidden else ""
+        self.push_screen(Confirm(f"Archive {len(self.marked)} marked items?{note}"), do)
 
     def _archive(self, ids: list[str]) -> None:  # worker thread
         try:
@@ -320,12 +367,11 @@ class InboxApp(App):
             return
 
         def done() -> None:
-            self.notify(f"Archived {len(ids)} items")
+            self.notify(f"Archived {len(ids)} items (press r to re-sync with Asana)")
             self.marked -= set(ids)
-            # Drop locally right away; the reload confirms against the server.
+            # The mutation was committed; drop locally instead of an expensive full reload.
             self.items = [it for it in self.items if it.id not in set(ids)]
             self.refresh_table()
-            self.action_reload()
 
         self.call_from_thread(done)
 
