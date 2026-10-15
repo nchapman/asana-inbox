@@ -106,6 +106,8 @@ In the table:
 
 After archiving, rows disappear immediately; press `r` to re-sync with Asana.
 
+To change the color theme, open the command palette with `ctrl+p` and choose *Change theme*. The choice is saved in `~/.config/asana-inbox/settings.json` (or under `$XDG_CONFIG_HOME`).
+
 ## Command-line client
 
 `asana_web.py` exposes the same protocol without the UI. It's handy for debugging:

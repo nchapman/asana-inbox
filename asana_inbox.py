@@ -13,11 +13,13 @@ see --browser/--profile/--cookies, and `./asana_web.py --help` for exporting a c
 """
 
 import argparse
+import json
 import os
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Protocol
 
 from rich.text import Text
@@ -98,6 +100,29 @@ class FakeBackend:
     def archive(self, ids: list[str]) -> None:
         for i in ids:
             self.items.pop(i, None)
+
+
+SETTINGS = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+            / "asana-inbox" / "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_setting(key: str, value) -> None:
+    settings = load_settings()
+    if settings.get(key) == value:
+        return
+    settings[key] = value
+    try:
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+    except OSError:
+        pass  # not worth failing the UI over
 
 
 KINDS = {
@@ -326,6 +351,11 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Theme (picked via ctrl+p → "Change theme") persists across runs.
+        saved = load_settings().get("theme")
+        if saved in self.available_themes:
+            self.theme = saved
+        self.theme_changed_signal.subscribe(self, lambda theme: save_setting("theme", theme.name))
         table = self.query_one(DataTable)
         # Fixed width: an auto-sized empty column shrinks to 0 and in-place marks become invisible.
         self.mark_col = table.add_column("", width=1)
