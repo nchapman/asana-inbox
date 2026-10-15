@@ -694,6 +694,11 @@ class SyncClient:
                     "projects": names,
                     "assignee": self.user_name(task.get("assignee")) if kind == "Task" else None,
                     "mine": kind == "Task" and task.get("assignee") == self.du,
+                    # dueDate: ms at UTC midnight of a date-only due; dueTime: exact ms if timed
+                    "due_date": (datetime.fromtimestamp(task["dueDate"] / 1000, timezone.utc).date()
+                                 .isoformat() if kind == "Task" and task.get("dueDate") else None),
+                    "due_time": (task["dueTime"] / 1000 if kind == "Task" and task.get("dueTime")
+                                 else None),
                     "notifications": nids,
                     "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
                 })

@@ -17,7 +17,7 @@ import os
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Protocol
 
 from rich.text import Text
@@ -40,6 +40,22 @@ class InboxItem:
     url: str = ""
     assignee: str | None = None
     mine: bool = False  # assigned to the current user
+    due: datetime | None = None  # local time; midnight for date-only dues
+    due_has_time: bool = False
+
+    def due_text(self) -> Text | str:
+        if self.due is None:
+            return ""
+        label = self.due.strftime("%Y-%m-%d %H:%M" if self.due_has_time else "%Y-%m-%d")
+        if self.completed:
+            return Text(label, style="dim")
+        now = datetime.now()
+        overdue = self.due < now if self.due_has_time else self.due.date() < now.date()
+        if overdue:
+            return Text(label, style="bold red")
+        if self.due.date() == now.date():
+            return Text(label, style="yellow")
+        return label
 
 
 class Backend(Protocol):
@@ -66,6 +82,8 @@ class FakeBackend:
                 url=f"https://app.asana.com/1/0/task/{1000 + i}",
                 assignee=(mine := rnd.random() < 0.3) and "Me" or rnd.choice([None, "Alice", "Bob"]),
                 mine=mine,
+                due=(now.replace(hour=0, minute=0, second=0, microsecond=0)
+                     + timedelta(days=rnd.randint(-10, 20))) if rnd.random() < 0.5 else None,
             )
             for i in range(n)
         }
@@ -123,6 +141,10 @@ class WebBackend:
                 url=it.get("urls", {}).get(project) or it.get("url", ""),
                 assignee=it.get("assignee"),
                 mine=it.get("mine", False),
+                due=(datetime.fromtimestamp(it["due_time"]) if it.get("due_time")
+                     else datetime.combine(date.fromisoformat(it["due_date"]), datetime.min.time())
+                     if it.get("due_date") else None),
+                due_has_time=bool(it.get("due_time")),
             ))
         return items
 
@@ -135,6 +157,8 @@ SORTS = {
     "title": lambda it: (it.title.lower(), it.project.lower()),
     "newest": lambda it: -it.updated.timestamp(),
     "oldest": lambda it: it.updated.timestamp(),
+    # soonest/most overdue first; no due date last, then newest activity
+    "due": lambda it: (it.due is None, it.due or datetime.max, -it.updated.timestamp()),
 }
 
 
@@ -228,7 +252,7 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Assignee", "Kind", "Updated", "Also in")
+        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Assignee", "Due", "Kind", "Updated", "Also in")
         self.action_reload()
 
     def action_reload(self) -> None:
@@ -267,6 +291,7 @@ class InboxApp(App):
                 "✓" if it.completed else "",
                 Text(it.title, style="bold" if it.mine else ""),
                 Text("★ me", style="bold yellow") if it.mine else (it.assignee or ""),
+                it.due_text(),
                 it.kind,
                 it.updated.strftime("%Y-%m-%d %H:%M"),
                 ", ".join(p for p in it.projects if p != it.project)[:60],
