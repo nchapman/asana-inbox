@@ -32,6 +32,7 @@ class InboxItem:
     kind: str
     updated: datetime
     projects: list[str] = field(default_factory=list)  # all projects; `project` is the grouping one
+    completed: datetime | None = None
 
 
 class Backend(Protocol):
@@ -54,6 +55,7 @@ class FakeBackend:
                 project=rnd.choice(projects),
                 kind=rnd.choice(kinds),
                 updated=now - timedelta(hours=rnd.randint(1, 24 * 60)),
+                completed=now if rnd.random() < 0.2 else None,
             )
             for i in range(n)
         }
@@ -83,21 +85,25 @@ class WebBackend:
         self.web = WebInbox(du, view, profile, n)
         self.ignore = ignore
 
-    def primary_project(self, projects: list[str]) -> str:
+    def primary_project(self, projects: list[str], kind: str) -> str:
         # Asana lists broad memberships (company goals, planning boards) first; the most
         # specific project tends to be last.
         useful = [p for p in projects if p not in self.ignore]
-        return (useful or projects or ["(no project)"])[-1]
+        if useful or projects:
+            return (useful or projects)[-1]
+        return {"conversation": "(conversations)", "daily summary": "(daily summaries)"}.get(
+            kind, "(no project)")
 
     def list_items(self) -> list[InboxItem]:
         return [
             InboxItem(
                 id=it["id"],
                 title=it["title"],
-                project=self.primary_project(it["projects"]),
+                project=self.primary_project(it["projects"], KINDS.get(it["type"], "")),
                 kind=KINDS.get(it["type"], it["type"] or "?"),
                 updated=datetime.fromtimestamp(it["updated"]),
                 projects=it["projects"],
+                completed=datetime.fromtimestamp(it["completed"]) if it.get("completed") else None,
             )
             for it in self.web.list_items()
         ]
@@ -159,6 +165,7 @@ class InboxApp(App):
         Binding("slash", "regex(False)", "Mark /re/"),
         Binding("backslash", "regex(True)", "Unmark /re/"),
         Binding("p", "toggle_project", "Mark project"),
+        Binding("c", "toggle_completed", "Mark completed"),
         Binding("a", "toggle_all", "All/none"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("x", "archive", "Archive marked"),
@@ -179,7 +186,7 @@ class InboxApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "Project", "Title", "Kind", "Updated", "Also in")
+        self.query_one(DataTable).add_columns("", "Project", "Done", "Title", "Kind", "Updated", "Also in")
         self.action_reload()
 
     def action_reload(self) -> None:
@@ -214,6 +221,7 @@ class InboxApp(App):
             table.add_row(
                 "●" if it.id in self.marked else "",
                 project,
+                "✓" if it.completed else "",
                 it.title,
                 it.kind,
                 it.updated.strftime("%Y-%m-%d %H:%M"),
@@ -249,6 +257,16 @@ class InboxApp(App):
             return
         ids = {it.id for it in self.items if it.project == cur.project}
         self.marked = self.marked - ids if ids <= self.marked else self.marked | ids
+        self.refresh_table()
+
+    def action_toggle_completed(self) -> None:
+        ids = {it.id for it in self.items if it.completed}
+        if not ids:
+            self.notify("No completed tasks in the inbox")
+            return
+        unmark = ids <= self.marked
+        self.marked = self.marked - ids if unmark else self.marked | ids
+        self.notify(f"{'Unmarked' if unmark else 'Marked'} {len(ids)} completed tasks")
         self.refresh_table()
 
     def action_toggle_all(self) -> None:
@@ -319,7 +337,7 @@ def main() -> None:
     ap.add_argument("--view", type=int, default=os.environ.get("ASANA_VIEW"),
                     help="inbox objectViewId (env ASANA_VIEW)")
     ap.add_argument("--profile", help="Firefox profile name or directory")
-    ap.add_argument("-n", type=int, default=50, help="threads to load")
+    ap.add_argument("-n", type=int, default=0, help="threads to load (0 = all)")
     ap.add_argument("--ignore-project", action="append",
                     default=[p for p in os.environ.get("ASANA_IGNORE_PROJECTS", "").split(",") if p],
                     help="don't group by this project if the task has others (repeatable; "

@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -355,6 +356,25 @@ class SyncClient:
                 "timestamp": int(time.time() * 1000), "unread": False,
             }, expensive_mutation=True)
 
+    async def load_inbox(self, n: int, view_id: int | None, log=None) -> int:
+        """n > 0: load n threads. n == 0: load everything by doubling the request until the
+        server returns fewer threads than asked. Returns the number of threads loaded."""
+        if n > 0:
+            await self.sub_inbox(n, view_id)
+            return len(self.inbox_threads())
+        n, got = 100, 0
+        while True:
+            await self.sub_inbox(n, view_id)
+            prev, got = got, len(self.inbox_threads())
+            if log:
+                log(f"asked {n} threads, got {got}")
+            if got < n:
+                return got
+            if got <= prev:  # server stopped growing: probably a cap on numAdditionalThreads
+                raise AsanaError(f"inbox stuck at {got} threads; server may cap numAdditionalThreads")
+            await self.send({"msg": "unsub", "id": str(self.next_id)})
+            n *= 2
+
     async def sub(self, name: str, params: dict, timeout: float = 30) -> None:
         self.next_id += 1
         sid = str(self.next_id)
@@ -424,10 +444,12 @@ class SyncClient:
         }, timeout=90)
 
     def inbox_threads(self) -> list[dict]:
+        # One value per inbox sub (keyed by its params); after load_all re-subs, take the longest.
         order = []
         for (coll, id_), doc in self.store.docs.items():
             if coll == "ServerComputedValue" and "currentDomainUserInboxThreads" in id_:
-                order = doc.get("value") or []
+                if len(doc.get("value") or []) > len(order):
+                    order = doc["value"]
         threads = []
         for tid in order:
             t = self.store.get("ComputedObject", tid)
@@ -454,6 +476,13 @@ class SyncClient:
             })
         return threads
 
+    def fallback_title(self, t: dict) -> str:
+        obj = self.store.get("DbObject", t["object"] or "")
+        if obj.get("typeName") == "DailySummaryStory" and obj.get("date"):
+            day = datetime.fromtimestamp(int(obj["date"]) / 1000, timezone.utc).date()
+            return f"Daily summary for {day}"
+        return obj.get("name") or f"({t['type']} {t['thread']})"
+
     def task_projects(self, task_id: str) -> list[str]:
         key = json.dumps(["taskProjectsContainingThis", task_id, {}], separators=(",", ":"))
         ids = self.store.get("ServerComputedValue", key).get("value") or []
@@ -467,8 +496,10 @@ class SyncClient:
             pot = t["object"] if t["object_type"] == "Pot" else None
             groups: dict[str | None, list[str]] = {}
             for nid in t["notifications"]:
-                n = self.store.get("DbObject", nid)
-                groups.setdefault(n.get("storyParent"), []).append(nid)
+                parent = self.store.get("DbObject", nid).get("storyParent")
+                if self.store.get("DbObject", parent or "").get("typeName") == "DomainUser":
+                    parent = None  # e.g. daily summaries hang off the recipient, not a task
+                groups.setdefault(parent, []).append(nid)
             for task_id, nids in groups.items():
                 notifs = [self.store.get("DbObject", n) for n in nids]
                 task = self.store.get("DbObject", task_id or "")
@@ -483,7 +514,9 @@ class SyncClient:
                     "thread": t["thread"],
                     "task_id": task_id,
                     "type": t["type"],
-                    "title": task.get("name") or t["task"] or f"({t['type']} {t['thread']})",
+                    "title": task.get("name") or self.fallback_title(t),
+                    # Task.completed is 0 or the completion time in ms
+                    "completed": (task.get("completed") or 0) / 1000 or None,
                     "projects": projects,
                     "notifications": nids,
                     "updated": max((n.get("__creationTime") or 0) for n in notifs) / 1000,
@@ -504,7 +537,7 @@ class WebInbox:
     """Blocking wrapper for the TUI. Each call opens a fresh websocket (run it in a worker
     thread); HTTP bootstrap (release, bundle version) is done once and reused."""
 
-    def __init__(self, du: str, view: int | None, profile: str | None = None, n: int = 50):
+    def __init__(self, du: str, view: int | None, profile: str | None = None, n: int = 0):
         self.du, self.view, self.n = du, view, n
         self.sess = Session(find_profile(profile))
         self.rev, bundle = self.sess.release_info()
@@ -520,7 +553,7 @@ class WebInbox:
     async def _list(self) -> list[dict]:
         client = await self._client()
         try:
-            await client.sub_inbox(self.n, self.view)
+            await client.load_inbox(self.n, self.view)
             return client.inbox_items()
         finally:
             await client.close()
@@ -600,7 +633,7 @@ async def open_inbox(args) -> tuple[SyncClient, list[dict]]:
                         Path(args.dump) if args.dump else None)
     await client.connect(ss["session_id"], ver, rev)
     print("connected", file=sys.stderr)
-    await client.sub_inbox(args.n, args.view)
+    await client.load_inbox(args.n, args.view, log=lambda s: print(s, file=sys.stderr))
     return client, client.inbox_threads()
 
 
@@ -669,7 +702,7 @@ def main() -> None:
         p.add_argument("--du", default=os.environ.get("ASANA_DU"), required="ASANA_DU" not in os.environ,
                        help="domain user id (web inbox URL /1/<domain>/inbox/<du>; env ASANA_DU)")
         p.add_argument("--shard", help="shardId (default: domain id)")
-        p.add_argument("-n", type=int, default=50, help="numAdditionalThreads")
+        p.add_argument("-n", type=int, default=0, help="threads to load (0 = all)")
         p.add_argument("--view", type=int, default=os.environ.get("ASANA_VIEW"),
                        help="inbox objectViewId (env ASANA_VIEW)")
         p.add_argument("--dump", help="append raw frames as JSONL (contains internal data; don't commit)")
