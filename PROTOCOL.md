@@ -4,10 +4,16 @@ Undocumented; derived from a HAR of the web app. Expect breakage on Asana releas
 
 ## Bootstrap (HTTP, session cookie)
 
-1. `GET https://app.asana.com/app/asana/-/start_session` → JSON `{session_id, app_data, luna_app_data}`.
-2. Inbox page HTML (`/1/<domain>/inbox/<domain_user>`) contains `release_revision=<YYYYMMDD_HHMMSS_<commit>>`
+Cookies used: `ticket` (CSRF token), `user` (user gid), `last_domain` (workspace gid).
+Note user gid ≠ domain-user gid (the one in `/1/<domain>/inbox/<du>`).
+
+1. App page HTML (`/1/<domain>/…`) contains `release_revision=<YYYYMMDD_HHMMSS_<commit>>`
    and the bundle URL `.../build/bundles/<commit>/apps/asana/bundle.js` (public CloudFront, ~46 MB).
-3. `bundle.js` contains `{version:"<projectionBundleVersion>",clientQueries:...}`. Cache per commit.
+2. `bundle.js` contains `{version:"<projectionBundleVersion>",clientQueries:...}`. Cache per commit.
+3. `GET /app/asana/-/start_session?path=<url-path>&query_string=&user_id=<user>&optimistic_pageload=true
+   &locale=en&release_revision=<rev>&shard_id=<domain>&guid=<uuid4>`
+   with header `X-Asana-Ticket: <ticket cookie>` (without it: 403; POST: 400)
+   → JSON `{session_id, app_data, luna_app_data}`.
 
 ## Websocket
 
@@ -18,7 +24,13 @@ with cookie + `Origin: https://app.asana.com`. JSON frames; server batches recei
   → `{"msg":"connected",…}`
 - server `ping` → client `pong`
 - send `{"msg":"sub","id":"<n>","name":"<ProjectionName>","params":{…},"metadata":{…},"behavior":{…}}`
-  → `added`/`changed`/`batch_removed` of `{collection, id, fields}`, then `subscription_state`
+  where web app sends `metadata={idleTimeMs, isReconnect:false, isDuringPageLoad:false, loadsEssentialDataForPageLoad:true}`,
+  `behavior={deferInvalidationReloadsWhenHidden:true, shouldDebugTrace:false}`.
+  Range params elsewhere use `{"type":"RelativeRange","lower_delta":0,"lower_bound":{"type":"SpecialRank.Min"},
+  "upper_bound":{"type":"SpecialRank.Min"},"upper_delta":N}`.
+  → `added`/`changed`/`batch_removed` of `{collection, id, fields}`, then
+  `{"msg":"subscription_state","id":"<n>","state":"ready"}`. The server also pushes its own sub
+  (`id:"-1"`: Domain object + `ipIsAllowedAccess`) right after the first sub; ignore it.
 - send `{"msg":"mutation","method":"/<name>","params":{"http_method":"post","endpoint_data":{…,"__app_name":"asana","__session_id":…}},"id":"<n>"}`
   → `committed`
 
@@ -29,13 +41,19 @@ Collections: `DbObject` (typed by `fields.typeName`), `ComputedObject`, `ServerC
 Sub `CurrentDomainUserProjectionInbox` with `db_object_id=<du>` and `inboxThreadsInfo`:
 `{showUnread:true, inboxTab:"activity", upperTimestampBound:8640000000000000, lowerTimestampBound:8640000000000000,
 numAdditionalThreads:5, listThreadSize:3, multifilterParams:{objectViewId:…, multifilterList:[], inboxSortOverride:[{sortType:"priority",value:"recency"}]}}`
-(full captured params are large; most are UI-only and may be droppable — untested).
+The minimal form (only `db_object_id` + `inboxThreadsInfo`) gets `{"msg":"error","reason":"Unexpected internal error"}`.
+The full captured param set is in `SyncClient.sub_inbox` (`asana_web.py`); which keys are required is untested.
+`currentDomainUserId` is sent as a number, `db_object_id` as a string; `objectViewId` is a per-user inbox view id.
 
 - `ServerComputedValue ["currentDomainUserInboxThreads", du, {...}]` → `fields.value`: ordered `InboxThread/<threadId>|<suffix>` ids.
 - `ComputedObject InboxThread/...` → `{notificationThread, threadObject, threadTypeName, notifications:[ids], isArchived}`.
 - `DbObject` Notification → `{story, storyParent (task), notificationThread, unread}`.
-- `DbObject` Task → `name`. No project membership seen on Task; `threadObject` may be a `Pot` (project).
-- Pagination: presumably via `numAdditionalThreads` / timestamp bounds — untested.
+- `DbObject` Task → `name`. `threadObject` is the Task, or a `Pot` (project) for e.g. `TaskAddedToPotNotificationThread`.
+- Projects of a task: `ServerComputedValue ["taskProjectsContainingThis","<task>",{}]` → `value: [pot ids]`;
+  `DbObject` Pot → `name`. All included in the inbox sub.
+- Server echoes the resolved query as the `currentDomainUserInboxThreads` key, with `lowerTimestampBound`
+  = oldest loaded thread (ms) and `numAdditionalThreads:0`. Pagination presumably re-subs with that
+  bound + `numAdditionalThreads` — untested.
 
 ## Archiving
 

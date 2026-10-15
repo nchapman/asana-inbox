@@ -1,3 +1,4 @@
 capture.har
 capture.clean.har
 __pycache__/
+*.jsonl
