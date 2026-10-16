@@ -125,6 +125,14 @@ def save_setting(key: str, value) -> None:
         pass  # not worth failing the UI over
 
 
+PROJECT_WIDTH = 30  # max chars for the Project column
+TITLE_WIDTH = 72  # max chars for the Title column
+
+
+def ellipsize(text: str, width: int = PROJECT_WIDTH) -> str:
+    return text if len(text) <= width else text[: width - 1].rstrip() + "…"
+
+
 KINDS = {
     "TaskNotificationThread": "task",
     "TaskAddedToPotNotificationThread": "added to project",
@@ -318,6 +326,7 @@ class InboxApp(App):
         Binding("c", "toggle_completed", "Mark completed"),
         Binding("a", "toggle_all", "All/none"),
         Binding("s", "cycle_sort", "Sort"),
+        Binding("w", "toggle_truncate", "Full width"),
         Binding("y", "copy_url", "Copy URL"),
         Binding("x", "archive", "Archive marked"),
         Binding("r", "reload", "Reload"),
@@ -331,6 +340,7 @@ class InboxApp(App):
         self.marked: set[str] = set()
         self.sort = "project"
         self.filter: re.Pattern | None = None
+        self.truncate: bool = load_settings().get("truncate", True)
 
     @staticmethod
     def match_text(it: InboxItem) -> str:
@@ -420,6 +430,9 @@ class InboxApp(App):
         cursor_id = self.current_id()
         scroll_y = table.scroll_y
         table.clear()
+        for col in table.columns.values():  # clear() keeps old widths; let columns shrink again
+            if col.auto_width:
+                col.content_width = col.label.cell_len
         prev_project = None
         shown = self.visible()
         for it in sorted(shown, key=SORTS[self.sort]):
@@ -427,20 +440,29 @@ class InboxApp(App):
             prev_project = it.project
             table.add_row(
                 "●" if it.id in self.marked else "",
-                project,
+                self.cut(project, PROJECT_WIDTH),
                 "✓" if it.completed else "",
-                Text(it.title, style="bold" if it.mine else ""),
+                Text(self.cut(it.title, TITLE_WIDTH), style="bold" if it.mine else ""),
                 Text("★ me", style="bold yellow") if it.mine else (it.assignee or ""),
                 it.due_text(),
                 it.kind,
                 it.updated.strftime("%Y-%m-%d %H:%M"),
-                ", ".join(p for p in it.projects if p != it.project)[:60],
+                ", ".join(p for p in it.projects if p != it.project),  # last column: never cut
                 key=it.id,
             )
         table.scroll_to(y=scroll_y, animate=False)
         if cursor_id in {it.id for it in shown}:
             table.move_cursor(row=table.get_row_index(cursor_id), scroll=False)
         self.update_status(shown)
+
+    def cut(self, text: str, width: int) -> str:
+        return ellipsize(text, width) if self.truncate else text
+
+    def action_toggle_truncate(self) -> None:
+        self.truncate = not self.truncate
+        save_setting("truncate", self.truncate)
+        self.refresh_table()
+        self.notify("Long titles/projects shortened" if self.truncate else "Showing full titles/projects")
 
     def update_status(self, shown: list[InboxItem]) -> None:
         self.title = "Asana Inbox"

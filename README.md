@@ -89,6 +89,7 @@ Each row is one task (or conversation, daily summary, …) with unread notificat
 | `/` and `\` | Mark / unmark shown rows matching a regex |
 | `f` | Filter by regex (`Esc` or an empty filter clears it) |
 | `s` | Cycle sort: project → title → newest → oldest → due |
+| `w` | Toggle shortening long titles (72 chars) and the Project column (30 chars) |
 | `y` | Copy the row's Asana link to the clipboard (OSC 52; in tmux, set `set-clipboard on`) |
 | `x` | Archive marked rows (asks for confirmation) |
 | `r` | Reload from Asana |
@@ -106,7 +107,7 @@ In the table:
 
 After archiving, rows disappear immediately; press `r` to re-sync with Asana.
 
-To change the color theme, open the command palette with `ctrl+p` and choose *Change theme*. The choice is saved in `~/.config/asana-inbox/settings.json` (or under `$XDG_CONFIG_HOME`).
+To change the color theme, open the command palette with `ctrl+p` and choose *Change theme*. The theme and the `w` setting are saved in `~/.config/asana-inbox/settings.json` (or under `$XDG_CONFIG_HOME`).
 
 ## Command-line client
 
