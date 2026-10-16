@@ -4,3 +4,4 @@ __pycache__/
 *.jsonl
 cookies*.txt
 .env
+.envrc

@@ -4,6 +4,21 @@ A terminal UI for bulk-archiving your Asana Inbox. You can group items by projec
 
 Asana's public API has no Inbox endpoint, so this tool talks to the web app's private sync protocol using your browser's login cookies. That protocol is undocumented and may break when Asana ships a release (see `PROTOCOL.md`).
 
+![Inbox grouped by project, with a few rows marked (Solarized Dark theme)](docs/main.svg)
+
+## Screenshots
+
+All screenshots use the built-in fake data (`./asana_inbox.py --fake`).
+
+| | |
+| --- | --- |
+| **Sorted by due date**: overdue in red, due today in yellow | **Filtered** with `f mine`, then all shown rows marked with `a` |
+| ![Due-date sort](docs/sort-due.svg) | ![Filter to my tasks](docs/filter.svg) |
+| **Details** (`Enter`): description, projects and notifications | **Archive confirmation** (`x`) listing what will be archived |
+| ![Task details](docs/details.svg) | ![Archive confirmation](docs/archive.svg) |
+
+Regenerate them with `./docs/screenshots.py`.
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/). It installs Python and the dependencies on first run.

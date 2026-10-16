@@ -68,14 +68,15 @@ class Backend(Protocol):
 
 
 class FakeBackend:
+    """Generated inbox for trying the UI (--fake) and for docs/screenshots.py."""
+
     def __init__(self, n: int = 60):
         rnd = random.Random(1)
-        projects = ["Platform", "Website", "Mobile App", "Customer Support", "(no project)",
+        project_names = ["Platform", "Website", "Mobile App", "Customer Support",
                     # longer than PROJECT_WIDTH, to exercise shortening (`w`)
                     "Infrastructure Reliability & Observability Initiatives"]
         verbs = ["Fix", "Investigate", "Rotate", "Upgrade", "Review"]
         things = ["login timeout", "flaky CI job", "database migration", "TLS certificate", "search index"]
-        kinds = ["comment", "assigned", "completed", "status update"]
         # Some titles longer than TITLE_WIDTH, to exercise shortening (`w`).
         long_tails = [
             ": follow up from the incident review, confirm alert thresholds and update the runbook",
@@ -84,33 +85,68 @@ class FakeBackend:
         ]
         # Broad boards a task is often also in, shown in the "Also in" column.
         boards = ["Company Goals", "Team Roadmap", "Engineering Backlog", "Q4 Planning"]
+        people = ["Alice", "Bob", "Carol", "Dan"]
+        comments = [
+            "Reproduced on staging, looks like a timeout in the auth proxy.",
+            "Can we get this done before the release freeze?",
+            "PR is up, would appreciate a review.",
+            "Moved the due date, waiting on the vendor.",
+            "Done on my side, please verify.",
+        ]
+        descriptions = [
+            "Users report intermittent failures. Collect logs from the last week, find the common "
+            "pattern and propose a fix.\n\nAcceptance: no failures in 7 days of monitoring.",
+            "Follow-up from the last incident review.\n\n- update the runbook\n- add an alert\n"
+            "- share findings in the weekly sync",
+            "",
+        ]
         now = datetime.now()
 
         def memberships(project: str) -> list[str]:
-            if project == "(no project)":
-                return []
             return [*rnd.sample(boards, rnd.choice([0, 0, 1, 2, 3])), project]
 
-        self.items = {
-            str(i): InboxItem(
+        def events(updated: datetime) -> list[dict]:
+            count = rnd.randint(1, 4)
+            out, t = [], updated - timedelta(hours=rnd.randint(4, 30) * count)
+            for _ in range(count):
+                t += timedelta(hours=rnd.randint(2, 30), minutes=rnd.randint(0, 59))
+                what = rnd.choice(["comment", "comment", "task assigned", "task due date changed",
+                                   "added follower"])
+                out.append({"time": min(t, updated).timestamp(), "who": rnd.choice(people),
+                            "what": what, "text": rnd.choice(comments) if what == "comment" else ""})
+            return out
+
+        self.items = {}
+        for i in range(n):
+            kind = rnd.choices(["task", "added to project", "conversation", "daily summary"],
+                               weights=[14, 4, 1, 1])[0]
+            updated = now - timedelta(hours=rnd.randint(1, 24 * 60))
+            if kind == "daily summary":
+                title, project, projects = f"Daily summary for {updated.date()}", "(daily summaries)", []
+            else:
+                title = f"{rnd.choice(verbs)} {rnd.choice(things)}" + (
+                    rnd.choice(long_tails) if rnd.random() < 0.25 else "")
+                project = rnd.choice(project_names)
+                projects = memberships(project)
+            task = kind in ("task", "added to project")
+            mine = task and rnd.random() < 0.3
+            self.items[str(i)] = InboxItem(
                 id=str(i),
-                title=f"{rnd.choice(verbs)} {rnd.choice(things)}"
-                      + (rnd.choice(long_tails) if rnd.random() < 0.25 else ""),
-                project=(project := rnd.choice(projects)),
-                projects=memberships(project),
-                kind=rnd.choice(kinds),
-                updated=now - timedelta(hours=rnd.randint(1, 24 * 60)),
-                completed=now if rnd.random() < 0.2 else None,
-                url=f"https://app.asana.com/1/0/task/{1000 + i}",
-                assignee=(mine := rnd.random() < 0.3) and "Me" or rnd.choice([None, "Alice", "Bob"]),
+                title=title,
+                project=project,
+                projects=projects,
+                kind=kind,
+                updated=updated,
+                completed=updated if task and rnd.random() < 0.2 else None,
+                url=f"https://app.asana.com/1/0/project/0/task/{1000 + i}",
+                assignee="Me" if mine else (rnd.choice([None, *people]) if task else None),
                 mine=mine,
-                description="Fake description.\n\nSecond paragraph.",
-                events=[{"time": now.timestamp(), "who": "Alice", "what": "comment", "text": "Looks good"}],
+                description=rnd.choice(descriptions) if task else "",
+                events=events(updated) if kind != "daily summary" else [
+                    {"time": updated.timestamp(), "who": None, "what": "daily summary", "text": ""}],
                 due=(now.replace(hour=0, minute=0, second=0, microsecond=0)
-                     + timedelta(days=rnd.randint(-10, 20))) if rnd.random() < 0.5 else None,
+                     + timedelta(days=rnd.randint(-10, 20))) if task and rnd.random() < 0.5 else None,
             )
-            for i in range(n)
-        }
 
     def list_items(self, progress=None) -> list[InboxItem]:
         return list(self.items.values())
@@ -325,9 +361,9 @@ class Confirm(ModalScreen[bool]):
 class InboxApp(App):
     CSS = """
     RegexPrompt, Confirm, Detail { align: center middle; }
-    #detail { width: 90%; height: 90%; border: thick $accent; background: $surface; padding: 0 1; }
+    #detail { width: 90%; height: auto; max-height: 90%; border: thick $accent; background: $surface; padding: 0 1; }
     RegexPrompt Input { width: 70%; }
-    #confirm { width: 90%; max-width: 120; height: auto; max-height: 90%; padding: 1 2;
+    #confirm { width: 100; max-width: 90%; height: auto; max-height: 90%; padding: 1 2;
                border: thick $error; background: $surface; }
     #confirm-msg { width: 100%; text-style: bold; margin-bottom: 1; }
     #confirm-list { height: auto; max-height: 60vh; margin-bottom: 1; }
