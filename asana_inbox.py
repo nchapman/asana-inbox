@@ -70,16 +70,34 @@ class Backend(Protocol):
 class FakeBackend:
     def __init__(self, n: int = 60):
         rnd = random.Random(1)
-        projects = ["Platform", "Website", "Mobile App", "Customer Support", "(no project)"]
+        projects = ["Platform", "Website", "Mobile App", "Customer Support", "(no project)",
+                    # longer than PROJECT_WIDTH, to exercise shortening (`w`)
+                    "Infrastructure Reliability & Observability Initiatives"]
         verbs = ["Fix", "Investigate", "Rotate", "Upgrade", "Review"]
         things = ["login timeout", "flaky CI job", "database migration", "TLS certificate", "search index"]
         kinds = ["comment", "assigned", "completed", "status update"]
+        # Some titles longer than TITLE_WIDTH, to exercise shortening (`w`).
+        long_tails = [
+            ": follow up from the incident review, confirm alert thresholds and update the runbook",
+            " across all regions before the maintenance window, then notify the on-call rotation",
+            " (blocked on vendor support ticket; see thread for the latest workaround and ETA)",
+        ]
+        # Broad boards a task is often also in, shown in the "Also in" column.
+        boards = ["Company Goals", "Team Roadmap", "Engineering Backlog", "Q4 Planning"]
         now = datetime.now()
+
+        def memberships(project: str) -> list[str]:
+            if project == "(no project)":
+                return []
+            return [*rnd.sample(boards, rnd.choice([0, 0, 1, 2, 3])), project]
+
         self.items = {
             str(i): InboxItem(
                 id=str(i),
-                title=f"{rnd.choice(verbs)} {rnd.choice(things)}",
-                project=rnd.choice(projects),
+                title=f"{rnd.choice(verbs)} {rnd.choice(things)}"
+                      + (rnd.choice(long_tails) if rnd.random() < 0.25 else ""),
+                project=(project := rnd.choice(projects)),
+                projects=memberships(project),
                 kind=rnd.choice(kinds),
                 updated=now - timedelta(hours=rnd.randint(1, 24 * 60)),
                 completed=now if rnd.random() < 0.2 else None,
