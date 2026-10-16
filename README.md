@@ -4,7 +4,7 @@ A terminal UI for bulk-archiving your Asana Inbox. You can group items by projec
 
 Asana's public API has no Inbox endpoint, so this tool talks to the web app's private sync protocol using your browser's login cookies. That protocol is undocumented and may break when Asana ships a release (see `PROTOCOL.md`).
 
-[![Inbox grouped by project, with a few rows marked (Solarized Dark theme)](docs/main.svg)](docs/main.svg?raw=true)
+[![Inbox grouped by project, with a few rows marked (Solarized Dark theme)](docs/main.svg)](https://raw.githubusercontent.com/sochotnicky/asana-inbox/main/docs/main.svg)
 
 ## Screenshots
 
@@ -13,9 +13,9 @@ All screenshots use the built-in fake data (`./asana_inbox.py --fake`).
 | | |
 | --- | --- |
 | **Sorted by due date**: overdue in red, due today in yellow | **Filtered** with `f mine`, then all shown rows marked with `a` |
-| [![Due-date sort](docs/sort-due.svg)](docs/sort-due.svg?raw=true) | [![Filter to my tasks](docs/filter.svg)](docs/filter.svg?raw=true) |
+| [![Due-date sort](docs/sort-due.svg)](https://raw.githubusercontent.com/sochotnicky/asana-inbox/main/docs/sort-due.svg) | [![Filter to my tasks](docs/filter.svg)](https://raw.githubusercontent.com/sochotnicky/asana-inbox/main/docs/filter.svg) |
 | **Details** (`Enter`): description, projects and notifications | **Archive confirmation** (`x`) listing what will be archived |
-| [![Task details](docs/details.svg)](docs/details.svg?raw=true) | [![Archive confirmation](docs/archive.svg)](docs/archive.svg?raw=true) |
+| [![Task details](docs/details.svg)](https://raw.githubusercontent.com/sochotnicky/asana-inbox/main/docs/details.svg) | [![Archive confirmation](docs/archive.svg)](https://raw.githubusercontent.com/sochotnicky/asana-inbox/main/docs/archive.svg) |
 
 Regenerate them with `./docs/screenshots.py`.
 
