@@ -95,7 +95,7 @@ Each row is one task (or conversation, daily summary, …) with unread notificat
 | `r` | Reload from Asana |
 | `q` | Quit |
 
-The regex for `f`, `/` and `\` matches the project, title, other projects, kind and assignee, plus the words `done` (completed tasks) and `mine` (assigned to you). For example, `f mine` shows only your tasks, and `/Support Triage` marks every alert in that project.
+The regex for `f`, `/` and `\` matches the project, title, other projects, kind and assignee, plus the words `done` (completed tasks) and `mine` (assigned to you). For example, `f mine` shows only your tasks, and `/Support Triage` marks every row in that project.
 
 Bulk marking only affects rows the current filter shows. Marks survive filter changes, and the archive confirmation says how many marked rows are hidden.
 
