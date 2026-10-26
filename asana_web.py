@@ -26,7 +26,7 @@ Cookies (global options, before the subcommand):
               Set ASANA_UA to that browser's User-Agent if Cloudflare complains.
 
 Env: ASANA_UA (User-Agent override), ASANA_FF_CONTAINER (Firefox container id),
-     ASANA_DOMAIN (workspace gid; default: last_domain cookie).
+     ASANA_DOMAIN (workspace gid; default: the login's last_domain cookie).
      All ASANA_* vars may also live in a .env file (working dir, else script dir;
      see README) — the real environment wins.
 """
@@ -34,16 +34,23 @@ Env: ASANA_UA (User-Agent override), ASANA_FF_CONTAINER (Firefox container id),
 import argparse
 import asyncio
 import configparser
+import contextlib
 import json
 import os
 import re
 import shutil
 import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import urllib.parse
+try:
+    import readline  # noqa: F401  puts input() in raw mode: pasted lines aren't truncated at MAX_CANON
+except ImportError:
+    pass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -65,6 +72,15 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "asana-
 
 class AsanaError(RuntimeError):
     """Expected failure with a human-readable message (auth, HTTP, protocol)."""
+
+
+class NoWorkspaceError(AsanaError):
+    """The login names no workspace — recoverable via the inbox URL."""
+
+
+# keys load_env_file() copied into the environment from a .env file (as opposed to
+# values genuinely exported in the shell — those keep overriding .env on every run)
+env_file_keys: set[str] = set()
 
 
 def load_env_file() -> None:
@@ -115,6 +131,7 @@ def load_env_file() -> None:
         for key, value in parsed.items():
             if value and key not in preset:  # empty value (e.g. "KEY= # TODO") counts as unset
                 os.environ[key] = value
+                env_file_keys.add(key)  # came from a file, not a real shell export
         return  # first .env found wins; don't also load the script-dir one
 
 
@@ -142,10 +159,55 @@ def parse_view(text: str) -> tuple[str, set[str]] | None:
     return None
 
 
+def du_from_session(ss: dict) -> str | None:
+    """Domain user id (digits) from a start_session payload — the same fields the
+    web app reads. Defensive: any unexpected shape just means "not discovered"."""
+    if not isinstance(ss, dict):
+        return None
+    for path in ("app_data", "luna_app_data"):
+        du = ss.get(path).get("domain_user_id") if isinstance(ss.get(path), dict) else None
+        if isinstance(du, (str, int)) and str(du).isdigit():
+            return str(du)
+    route = ss.get("app_data").get("initial_route") if isinstance(ss.get("app_data"), dict) else {}
+    route = route if isinstance(route, dict) else {}
+    du = route.get("domainUser").get("id") if isinstance(route.get("domainUser"), dict) else None
+    return str(du) if isinstance(du, (str, int)) and str(du).isdigit() else None
+
+
+def view_ids_from_docs(docs: dict[tuple[str, str], dict]) -> tuple[str, list[tuple[str | None, str]]] | None:
+    """(default view id, [(name, id), …]) from a store fed by the FilterRow projection:
+    the Inbox DbObject carries defaultObjectView; its view children carry the names."""
+    inbox = next((id_ for (coll, id_), d in docs.items()
+                  if coll == "DbObject" and d.get("typeName") == "Inbox"), None)
+    if inbox is None:
+        return None
+    views = [(d.get("name"), id_) for (coll, id_), d in sorted(docs.items())
+             if coll == "DbObject" and d.get("object") == inbox]
+    default = docs.get(("DbObject", inbox), {}).get("defaultObjectView")
+    if default is not None and not str(default).isdigit():
+        default = None  # a shape surprise is treated as "not found", not trusted
+    if default is None:
+        cq = next((d.get("results") for (coll, id_), d in docs.items()
+                   if coll == "ConfirmedQuery" and id_.startswith(f"MultiViewable.objectViews|{inbox}|")
+                   and d.get("results")), None)
+        if cq:
+            cq = [str(i) for i in cq if str(i).isdigit()]
+            if cq:
+                names = {id_: name for name, id_ in views}
+                views = [(names.get(i), i) for i in cq]
+                default = cq[0]
+    if default is None:
+        return None
+    return str(default), views
+
+
 def update_env_file(path: Path, values: dict[str, str]) -> bool:
     """Set KEY=VALUE lines in an existing .env, keeping comments and other keys as-is
     (later duplicates dropped). Returns True if the file already existed.
     Writes via a temp file + rename so a failure can't truncate the old one."""
+    bad = [k for k, v in values.items() if "\n" in v or "\r" in v]
+    if bad:  # would inject extra lines; ids and cookies never contain newlines
+        raise AsanaError(f"refusing to write multi-line value(s) for {bad}")
     existed = path.exists()
     path = path.resolve()  # write through symlinks (dotfiles managers), not over them
     try:
@@ -402,19 +464,37 @@ def resolve_cookies(browser: str | None = None, profile: str | None = None,
 # ---------------------------------------------------------------- bootstrap
 
 
+def domain_from_route_hint(value: str | None) -> str | None:
+    """Workspace gid from the route_hint cookie ("1/<workspace>//<locale>", URL-encoded).
+    Fresh Chrome logins no longer set last_domain; route_hint still carries the
+    workspace of the last-visited domain."""
+    if not value:
+        return None
+    m = re.match(r"\d+/(\d{5,})//", urllib.parse.unquote(value))
+    return m.group(1) if m else None
+
+
 class Session:
     def __init__(self, browser: str | None = None, profile: str | None = None,
-                 cookie_file: str | None = None):
+                 cookie_file: str | None = None, domain: str | None = None,
+                 use_env: bool = True):
         global UA
         cookies, UA, self.source = resolve_cookies(browser, profile, cookie_file)
         self.cookies = cookies
         jar = dict(p.split("=", 1) for p in cookie_header(cookies, "app.asana.com").split("; ") if "=" in p)
-        missing = [k for k in ("ticket", "user", "last_domain") if k not in jar]
+        missing = [k for k in ("ticket", "user") if k not in jar]
         if missing:
             raise AsanaError(f"cookies from {self.source} missing {missing}; log in to Asana again")
         self.ticket = jar["ticket"]          # CSRF token, echoed as X-Asana-Ticket
         self.user_id = jar["user"]           # user gid
-        self.domain = os.environ.get("ASANA_DOMAIN", jar["last_domain"])  # workspace gid == shard_id
+        resolved = (domain or (os.environ.get("ASANA_DOMAIN") if use_env else None)
+                    or jar.get("last_domain")
+                    or domain_from_route_hint(jar.get("route_hint")))
+        if not resolved:
+            raise NoWorkspaceError(f"cookies from {self.source} name no workspace: no last_domain "
+                             "cookie and no parseable route_hint; pass the workspace from the "
+                             "inbox URL, or set ASANA_DOMAIN (see README)")
+        self.domain = resolved  # workspace gid == shard_id
         self.http = httpx.Client(
             headers={
                 "User-Agent": UA,
@@ -439,6 +519,11 @@ class Session:
                              f"  headers:\n{hdrs}\n  body: {body}")
         return r
 
+    def close(self) -> None:
+        """Release the HTTP connection pool (idempotent; the websocket is
+        SyncClient's to close)."""
+        self.http.close()
+
     def start_session(self, release: str, path: str | None = None) -> dict:
         path = path or f"/1/{self.domain}/home"
         params = {
@@ -451,7 +536,11 @@ class Session:
                         "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
                         "Sec-Fetch-Dest": "empty"})
         text = r.text
-        return json.loads(text[text.index("{"):])  # tolerate anti-JSON-hijack prefixes
+        try:
+            return json.loads(text[text.index("{"):])  # tolerate anti-JSON-hijack prefixes
+        except ValueError:
+            raise AsanaError(f"start_session body isn't JSON ({len(text)} bytes) — "
+                             "logged out, blocked, or a consent page?") from None
 
     def release_info(self) -> tuple[str, str]:
         """Return (release_revision, bundle_url) scraped from an app HTML page."""
@@ -464,22 +553,32 @@ class Session:
                 return rev.group(1), bundle.group(0)
         raise RuntimeError("release_revision/bundle not found in app HTML (logged out?)")
 
-    def bundle_version(self, bundle_url: str) -> str:
+    def bundle_version(self, bundle_url: str, stall: float = 60,
+                        deadline: float | None = None) -> str:
+        """First projectionBundleVersion in the bundle JS. The ~46 MB download uses
+        `stall` as the read timeout — no bytes for that long aborts — so a
+        slow-but-flowing link always finishes (and caches by bundle commit). Setup,
+        which must fall back to manual input, additionally passes an absolute
+        monotonic `deadline` capping the total wait."""
         commit = re.search(r"/bundles/([0-9a-f]+)/", bundle_url).group(1)
         cached = CACHE / f"bundle-version-{commit}"
         if cached.exists():
             return cached.read_text().strip()
         rx = re.compile(rb'\{version:"([^"]+)",clientQueries:')
         tail = b""
-        with httpx.stream("GET", bundle_url, headers={"User-Agent": UA}, timeout=120) as r:
+        with httpx.stream("GET", bundle_url, headers={"User-Agent": UA},
+                          timeout=httpx.Timeout(120, read=stall)) as r:
             r.raise_for_status()
-            for chunk in r.iter_bytes(1 << 20):
+            for chunk in r.iter_bytes(64 << 10):
                 buf = tail + chunk
                 if m := rx.search(buf):
                     CACHE.mkdir(parents=True, exist_ok=True)
                     cached.write_text(m.group(1).decode())
                     return m.group(1).decode()
                 tail = buf[-256:]
+                if deadline is not None and time.monotonic() > deadline:
+                    raise AsanaError("bundle download too slow — check the connection,"
+                                     " or paste the view id manually")
         raise RuntimeError("projectionBundleVersion not found in bundle")
 
 
@@ -699,6 +798,28 @@ class SyncClient:
             "shareable": {"shareableId": -1},
             "teamComputedMembershipForShareableParams": {"shareableId": -1},
         }, timeout=max(90.0, 0.15 * num_threads))
+
+    async def discover_view(self) -> tuple[str, list[tuple[str | None, str]]] | None:
+        """(default view id, [(name, id), …]) for the current user's inbox, via the
+        FilterRow projection the web app uses for its view tabs — no DevTools needed.
+        None when the sub fails or the store yields no Inbox object (fall back to manual)."""
+        try:
+            await self.sub("CurrentDomainUserProjectionInboxFilterRow", {
+                "db_object_id": self.du,
+                "dataPolicyParams": {"type": "not_applicable"},
+                "dataPolicyForCurrentDomainUserParams": {"type": "current_actor"},
+                "daysUntilUnblockRetrialsForWorkManagementParams": {"offering": "WorkManagement"},
+                "daysUntilUnblockRetrialsForClientManagementParams": {"offering": "client-management"},
+                "useDataBoundary": False,
+                "hasMachineLearningProductFeatureEnabledParams": {
+                    "featureKey": "metadata_ml_features", "featureFlag": "mc_priority_inbox",
+                    "logEnrollment": False},
+                "skipCFOptions": False,
+            }, timeout=60)
+        except (AsanaError, RuntimeError, TimeoutError) as e:
+            print(f"   view discovery failed ({str(e)[:120]})", file=sys.stderr)
+            return None
+        return view_ids_from_docs(self.store.docs)
 
     def inbox_threads(self) -> list[dict]:
         # One value per inbox sub (keyed by its params); after load_all re-subs, take the longest.
@@ -949,6 +1070,40 @@ def cmd_bootstrap(args) -> None:
         print(f"  {p} = {v!r}"[:200])
 
 
+_clip_tool: str | None = None  # name of the last tool that worked; tried first, reset on failure
+
+
+def sanitize(s: str, limit: int = 80) -> str:
+    """Printable-only, length-capped copy of server-provided text before it is echoed:
+    view names come from other users, so they must not carry terminal escapes."""
+    return "".join(ch for ch in s if ch.isprintable())[:limit] or "?"
+
+
+def read_clipboard() -> str | None:
+    """Text from the system clipboard, or None when no clipboard tool exists/fails.
+    Used for the big WS message: terminals truncate long pastes (macOS at 1 kB),
+    so setup prefers reading a DevTools \"Copy message\" straight from the clipboard."""
+    global _clip_tool
+    tools = {"pbpaste": ["pbpaste"],                       # macOS
+             "wl-paste": ["wl-paste", "--no-newline"],     # Wayland
+             "xclip": ["xclip", "-o", "-selection", "clipboard"],
+             "xsel": ["xsel", "--clipboard", "--output"]}
+    candidates = [(name, cmd) for name, cmd in tools.items() if shutil.which(name)]
+    if _clip_tool:
+        candidates.sort(key=lambda nc: nc[0] != _clip_tool)  # remember what worked
+    for name, cmd in candidates:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            continue  # tool exists but failed (headless, wedged display): try the next one
+        if out.returncode != 0:
+            continue
+        _clip_tool = name
+        return out.stdout or None
+    _clip_tool = None  # nothing worked: re-probe from scratch next time
+    return None
+
+
 def read_paste(prompt: str, parse) -> tuple[str, set[str]] | None:
     """Read a possibly multi-line paste (pretty-printed JSON), accumulating until it
     parses *and* looks complete (balanced braces) so keys on later lines — e.g.
@@ -956,6 +1111,7 @@ def read_paste(prompt: str, parse) -> tuple[str, set[str]] | None:
     buf = ""
     while True:
         line = input(prompt if not buf else "   …> ")
+        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")  # terminal paste markers
         buf = f"{buf}\n{line}" if buf else line
         if not line.strip():
             return parse(buf) if buf.strip() else None  # blank line: paste is done
@@ -963,75 +1119,257 @@ def read_paste(prompt: str, parse) -> tuple[str, set[str]] | None:
             return parsed
 
 
-def cmd_setup(args) -> None:
-    """Guided setup: parse the two IDs from pasted URL / WS message, check the login,
-    write .env. Non-interactive when both a URL and --view are given."""
-    print("asana-inbox setup — collects your two IDs and writes .env\n")
+async def discover_view_ids(sess, rev: str, ver: str, ss: dict, du: str):
+    """(default view id, [(name, id), …]) over the live sync socket, or None.
+    Connects, asks the FilterRow projection for the inbox's views, disconnects.
+    The bundle version is fetched by the caller (sync httpx, own budget) so this
+    coroutine stays pure websocket work the caller can time out cleanly.
+    Any failure (socket, payload, release) just means: fall back to manual input."""
+    client = None
     try:
-        # 1) domain user id, from the inbox URL
+        if not ss.get("session_id"):
+            raise AsanaError("start_session returned no session_id")
+        client = SyncClient(sess, du, sess.domain)
+        await client.connect(ss["session_id"], ver, rev)
+        return await client.discover_view()
+    except Exception as e:  # best-effort discovery; the manual path is the safety net
+        print(f"   view discovery failed ({type(e).__name__}: {str(e)[:120]})", file=sys.stderr)
+        return None
+    finally:
+        if client and client.ws:
+            with contextlib.suppress(Exception):
+                await client.ws.close()
+
+
+def cmd_setup(args) -> None:
+    """Guided setup: log in via browser cookies, discover the two IDs over the
+    protocol (URL/--view/--paste as fallback), write .env."""
+    print("asana-inbox setup — log in, discover your IDs, write .env\n")
+    try:
+        # 1) login: cookies from the browser (or --cookies FILE) come first —
+        # both IDs are derived from the session they unlock.
+        print("1) Asana login (cookies)")
         du = ws = ""
+        bare_du = False  # du arrived without a workspace: its workspace is unverified
         if args.url:
-            parsed = parse_du(args.url)
-            if not parsed:
+            if not (parsed := parse_du(args.url)):
                 raise AsanaError(f"no …/1/<workspace>/inbox/<id>/ in {args.url!r}")
             du, ws = parsed
+            bare_du = not ws
+        sess = None
+        while sess is None:
+            try:
+                sess = Session(args.browser, args.profile, args.cookies,
+                               domain=ws or os.environ.get("ASANA_DOMAIN") or None,
+                               use_env=False)  # an existing pin drives setup; a URL ws overrides it
+            except NoWorkspaceError:
+                # cookies alone name no workspace: the inbox URL carries it
+                print("   login works, but the cookies name no workspace.")
+                print("   Open your Inbox in the web app. The URL looks like")
+                print("   https://app.asana.com/1/<workspace>/inbox/<domain user id>/…")
+                raw = input("   paste that URL (⏎ to quit): ")
+                if not raw.strip():
+                    print("   no URL, no workspace — cancelled", file=sys.stderr)
+                    raise SystemExit(1) from None
+                parsed = parse_du(raw)
+                if parsed is None:
+                    print("   couldn't find …/1/<workspace>/inbox/<id>/ in that — try again\n")
+                    continue
+                du, found_ws = parsed
+                if not found_ws:
+                    print("   that's only the domain user id — paste the full inbox URL")
+                    print("   (the workspace in that URL is what gets pinned)\n")
+                    continue
+                ws = found_ws
+                bare_du = False  # the URL supplied the workspace after all
+            except AsanaError as e:
+                # not a dead end: the IDs can still be pasted at the prompts below
+                print("   ⚠ " + str(e).replace("\n", "\n     "))
+                print("     continuing without a login;"
+                      " the IDs must be pasted manually (README → Setup)")
+                break
+            except OSError as e:  # e.g. --cookies file missing
+                print("   ✗ " + str(e).replace("\n", "\n     "))
+                raise SystemExit(1) from None
+        if sess:
+            print(f"   ✓ logged in via {sess.source} (user {sess.user_id}, domain {sess.domain})\n")
+
+        # 2) the two IDs: URL/--view flags win, then protocol discovery, then prompts.
+        # A URL plus --view needs no protocol access at all.
+        ss: dict | None = None
+        switched = False
+        rev = bundle = ""
+        if not (args.url and args.view is not None) and sess:
+            try:
+                rev, bundle = sess.release_info()
+                ss = sess.start_session(rev)
+            except (AsanaError, OSError, RuntimeError, httpx.HTTPError) as e:
+                # discovery is optional; the prompts below are the fallback
+                print(f"2) protocol unreachable ({type(e).__name__}: {str(e)[:120]})")
+        if not du and ss:
+            du = du_from_session(ss) or ""
         while not du:
-            print("1) Domain user ID (ASANA_DU)")
-            print("   Open your Inbox in the Asana web app. The URL looks like")
+            print("2) Domain user ID (ASANA_DU)")
+            print("   couldn't discover it; open your Inbox in the web app. The URL looks like")
             print("   https://app.asana.com/1/<workspace>/inbox/<domain user id>/…")
-            parsed = parse_du(input("   Paste that URL (or just the number after /inbox/): "))
+            parsed = parse_du(input("   paste that URL (or just the number after /inbox/): "))
             if parsed:
                 du, ws = parsed
+                bare_du = not ws  # hand-supplied without a workspace: unverified pairing
                 break
             print("   couldn't find /1/<workspace>/inbox/<number>/ in that — try again\n")
-        print(f"   → domain user id {du}"
-              + (f" (workspace {ws})" if ws else "") + "\n")
+        if ws and sess and ws != sess.domain:
+            # the URL's workspace wins: otherwise discovery and the written IDs would
+            # target one workspace while every request runs against another
+            print(f"   ⚠ URL workspace {ws} ≠ cookie workspace {sess.domain} — switching to the URL's")
+            try:
+                old_sess, sess = sess, Session(args.browser, args.profile, args.cookies,
+                                               domain=ws, use_env=False)
+                old_sess.close()
+                ss, rev, bundle = None, "", ""  # refetched below under the right domain
+                switched = True
+            except (AsanaError, OSError) as e:
+                print("   ⚠ couldn't switch: " + str(e).replace("\n", " ")[:120])
+                if not (args.url and args.view is not None):
+                    raise SystemExit(1) from None
+                # both IDs come from the command line; the stale-domain session is unused below
+        if switched and sess and args.view is None:
+            # the workspace switch reset ss; refetch under the right domain
+            try:
+                rev, bundle = sess.release_info()
+                ss = sess.start_session(rev)
+            except (AsanaError, OSError, RuntimeError, httpx.HTTPError) as e:
+                print(f"2) protocol unreachable ({type(e).__name__}: {str(e)[:120]})")
+        print(f"   → domain user id {du}" + (f" (workspace {ws})" if ws else "") + "\n")
 
-        # 2) objectViewId, from the WS `sub` message (or --view)
-        while True:
+        # 2b) objectViewId: --view flag, else discovered via the FilterRow sub, else paste
+        view = str(args.view) if args.view is not None else None
+        if view is not None and view == du:
+            print("   ⚠ that --view value is the domain user id, not an objectViewId — ignored\n")
             view = None
+        discovered = None
+        if view is None:
+            print("2) Inbox view ID (ASANA_VIEW)")
+            if ss:
+                print("   discovering views over the sync socket"
+                      " (first run may download the ~46 MB app bundle;"
+                      " capped at ~5 min on a slow link)…")
+                ver = None
+                try:  # sync fetch: stall=read timeout, deadline=hard cap for setup
+                    ver = sess.bundle_version(bundle, stall=45,
+                                              deadline=time.monotonic() + 300)
+                except (AsanaError, RuntimeError, OSError, httpx.HTTPError) as e:
+                    print(f"   bundle fetch failed ({type(e).__name__}: {str(e)[:100]})")
+                if ver is not None:
+                    try:
+                        discovered = asyncio.run(asyncio.wait_for(
+                            discover_view_ids(sess, rev, ver, ss, du), 120))
+                    except TimeoutError:
+                        print("   discovery timed out — falling back to manual input")
+                        discovered = None
+            if discovered:
+                default, views = discovered
+                print(f"   ✓ discovered {len(views)} view(s):")
+                for name, vid in views:
+                    mark = " ← default" if vid == default else ""
+                    print(f"     {sanitize(vid)}  {sanitize(name or '(unnamed)')}{mark}")
+                view = default
+                if sys.stdin.isatty() and len(views) > 1:
+                    if input(f"   use the default view {default}? [Y/n] ").strip().lower() == "n":
+                        view = None
+                        while view is None:
+                            pick = input(f"   pick 1-{len(views)} (⏎: manual/clipboard entry): ").strip()
+                            if not pick:
+                                break  # empty answer: manual entry
+                            if pick.isdigit() and 1 <= int(pick) <= len(views):
+                                name, view = views[int(pick) - 1]
+                                print(f"   → {sanitize(view)}  {sanitize(name or '(unnamed)')}")
+                            else:
+                                print(f"   enter a number 1-{len(views)}, or ⏎ for manual entry")
+            if view is None:
+                print("   fallback: copy the objectViewId from DevTools (README → Setup).")
+                print("   Easiest: right-click the WS \"sub\" message → Copy message, then answer y")
+                print("   when it's offered below — it's read from the clipboard"
+                      " (terminals truncate long pastes).")
+        declined_view = None  # a clipboard value the user said "no" to; new values re-offer
+        while view is None:
             du_ids: set[str] = set()
-            if args.view is not None:
-                view = str(args.view)  # argparse type=int already validated it
-            else:
-                print("2) Inbox view ID (ASANA_VIEW)")
-                print("   In the browser: DevTools → Network → WS, reload the Inbox page,")
-                print("   click the cdn.sync.app.asana.com connection, filter messages for")
-                print("   CurrentDomainUserProjectionInbox and open the outgoing (↑) \"sub\" message.")
-                print("   The id is at params.inboxThreadsInfo.multifilterParams.objectViewId.")
-                parsed = read_paste("   Paste the whole JSON message (or just the id):\n   (blank line to retry)", parse_view)
+            source = ""  # "clipboard" | "paste"
+            if sys.stdin.isatty() and (clip := read_clipboard()) \
+                    and (cparsed := parse_view(clip)) and cparsed[0] != declined_view:
+                cview, cdu = cparsed
+                bare = clip.strip().strip("'\"").isdigit()  # a lone number, no message
+                if not (bare and cview == du):  # du still on the clipboard from step 2: skip
+                    if bare:
+                        accept = input(f"   clipboard has just the number {cview} — an objectViewId?"
+                                       " Use it? [y/N] ").strip().lower() == "y"
+                    else:
+                        ok = du in cdu  # offer, but only an explicit y accepts: clipboard
+                        # content is untrusted input — it must not land in .env by default
+                        note = ("✓ db_object_id matches the domain user id" if ok else
+                                "(no db_object_id to cross-check)" if not cdu else
+                                f"⚠ db_object_id {sorted(cdu)} doesn't match the domain user id")
+                        accept = input(f"   clipboard has it: objectViewId {cview}  {note}."
+                                       " Use it? [y/N] ").strip().lower() == "y"
+                    if not accept:
+                        declined_view = cview  # don't nag about the same value again
+                    else:
+                        view, source = cview, "clipboard"
+            if view is None:
+                parsed = read_paste("   or paste it here (macOS: just the id number —"
+                                    "\n   terminals truncate long pastes; blank line to retry)", parse_view)
                 if parsed:
                     view, du_ids = parsed
-            if not view:
-                print("   no objectViewId in that paste — try again\n")
+                    source = "paste"
+                    if view == du and not du_ids:
+                        print("   that's the domain user id, not an objectViewId — try again\n")
+                        view = None
+                        continue
+            if view is None:
+                print("   no objectViewId found — try again\n")
                 continue
-            if du_ids and du not in du_ids:
-                print(f"   ⚠ the message's db_object_id {sorted(du_ids)} doesn't match domain user id {du}")
-                print("     — likely the wrong message or URL; check the README's Setup section")
-                if input("     use this objectViewId anyway? [y/N] ").strip().lower() != "y":
-                    print()
-                    continue
-            elif du_ids:
-                print("   ✓ db_object_id matches the domain user id")
-            elif not args.view:
-                print("   (no db_object_id in the paste to cross-check)")
-            break
+            if source == "paste":
+                if du_ids and du not in du_ids:
+                    print(f"   ⚠ the message's db_object_id {sorted(du_ids)} doesn't match domain user id {du}")
+                    print("     — likely the wrong message or URL; check the README's Setup section")
+                    if input("     use this objectViewId anyway? [y/N] ").strip().lower() != "y":
+                        print()
+                        view = None
+                        continue
+                elif du_ids:
+                    print("   ✓ db_object_id matches the domain user id")
+                else:
+                    print("   (no db_object_id in the paste to cross-check)")
         print(f"   → objectViewId {view}\n")
 
-        # 3) login check (cheap: cookies only, no bundle download)
-        print("3) Asana login (cookies)")
-        try:
-            sess = Session(args.browser, args.profile, args.cookies)
-            print(f"   ✓ logged in via {sess.source} (user {sess.user_id}, domain {sess.domain})\n")
-        except (AsanaError, OSError) as e:  # OSError: e.g. --cookies file missing
-            print("   ✗ " + str(e).replace("\n", "\n     "))
-            print("     log in to app.asana.com, or re-run setup with --cookies FILE\n")
-
-        # 4) write .env in the directory we run from
+        # 3) write .env in the directory we run from
         env_path = Path.cwd() / ".env"
-        existed = update_env_file(env_path, {"ASANA_DU": du, "ASANA_VIEW": view})
+        values = {"ASANA_DU": du, "ASANA_VIEW": view}
+        # pin the workspace too: without it the runtime follows whatever last_domain
+        # says on the day — wrong for multi-workspace accounts and fresh profiles
+        if ws or (sess and sess.domain):
+            values["ASANA_DOMAIN"] = ws or sess.domain
+        elif old_pin := os.environ.get("ASANA_DOMAIN"):
+            # no workspace was learned: keep any existing pin rather than guess
+            print(f"   ⚠ ASANA_DOMAIN={old_pin} (from your env/.env) was left untouched —")
+            print("     remove it if it's not these IDs' workspace")
+        stale = {k: os.environ[k] for k, v in values.items()
+                 if (env := os.environ.get(k)) and env != v and k not in env_file_keys}
+        existed = update_env_file(env_path, values)
         print(f"{'updated' if existed else 'wrote'} {env_path}:")
-        print(f"  ASANA_DU={du}\n  ASANA_VIEW={view}")
+        for key, val in values.items():
+            print(f"  {key}={val}")
+        if stale:
+            print("   ⚠ values already exported in this shell override the file above —")
+            print("     unset them or re-run from a fresh shell, or they'll be used instead:")
+            for k, v in stale.items():
+                print(f"     {k}={v}")
+        if bare_du and "ASANA_DOMAIN" in values and values["ASANA_DOMAIN"]:
+            print(f"   ⚠ the domain user id was supplied without its workspace;")
+            print(f"     ASANA_DOMAIN={values['ASANA_DOMAIN']} was taken from your login/env pin —")
+            print("     re-run setup with the full inbox URL if this pairing is wrong")
+        if sess:
+            sess.close()
         print("\nTry it:  ./asana_web.py inbox -n 5   (or just ./asana_inbox.py)")
     except (EOFError, KeyboardInterrupt):
         print("\ncancelled; nothing written", file=sys.stderr)

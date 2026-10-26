@@ -26,11 +26,17 @@ Regenerate them with `./docs/screenshots.py`.
 
 ## Setup
 
-Easiest: run `./asana_web.py setup`. It walks you through the two IDs below — you paste the
-inbox URL and the WebSocket message it points you at — then checks your browser login and
-writes `.env` for you. Or find them by hand:
+Easiest: run `./asana_web.py setup` while logged in to app.asana.com in your
+browser (or with a [cookie file](#logins-without-a-browser-profile)). Setup reads the
+login from the browser, discovers both IDs over Asana's own protocol, and writes
+`.env` — including `ASANA_DOMAIN` (the workspace from your inbox URL), so
+multi-workspace accounts stay on the inbox you set up. No DevTools involved.
+Only if that fails does it fall back to asking:
+paste the inbox URL for the domain user ID, and for the view ID either **Copy
+message** in DevTools and confirm with `y` when it's offered (read from the
+clipboard; terminals truncate long pastes) or just paste the number itself.
 
-You need two IDs. Both are fixed per user, so find them once.
+Finding them by hand (the two IDs are fixed per user, so find them once):
 
 1. **Domain user ID** (`ASANA_DU`). Open your Inbox in the web app. The URL looks like
    `https://app.asana.com/1/<workspace>/inbox/<domain user id>/…`; use the number after `/inbox/`.
@@ -94,6 +100,7 @@ The file is a live login: run `chmod 600` on it and keep it out of git (`cookies
 | `--ignore-project NAME` / `ASANA_IGNORE_PROJECTS=a,b` | Don't group by broad projects like "Company Goals" when a task has more specific ones. |
 | `-n N` | Load only the newest N threads (default: all). |
 | `ASANA_FF_CONTAINER=N` | Use a Firefox Multi-Account Container's cookies. |
+| `ASANA_DOMAIN=<workspace>` | Pin the workspace (shard). Setup writes it; needed by hand only when the login cookies name no workspace (fresh profile) or name the wrong one. |
 
 ## Using it
 
