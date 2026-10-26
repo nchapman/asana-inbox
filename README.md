@@ -26,6 +26,10 @@ Regenerate them with `./docs/screenshots.py`.
 
 ## Setup
 
+Easiest: run `./asana_web.py setup`. It walks you through the two IDs below — you paste the
+inbox URL and the WebSocket message it points you at — then checks your browser login and
+writes `.env` for you. Or find them by hand:
+
 You need two IDs. Both are fixed per user, so find them once.
 
 1. **Domain user ID** (`ASANA_DU`). Open your Inbox in the web app. The URL looks like

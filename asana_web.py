@@ -6,6 +6,7 @@
 """Asana web-app sync client (undocumented protocol, see PROTOCOL.md).
 
     ./asana_web.py cookies                             # which cookie source is used (prints names only)
+    ./asana_web.py setup [URL] [--view ID]            # guided setup: parses IDs, writes .env
     ./asana_web.py bootstrap                           # release, bundle version, start_session, id candidates
     ./asana_web.py inbox --du ID [--view ID] [-n 50] [--dump frames.jsonl]
     ./asana_web.py archive --du ID THREAD_ID... [--yes]   # dry run without --yes
@@ -115,6 +116,62 @@ def load_env_file() -> None:
             if value and key not in preset:  # empty value (e.g. "KEY= # TODO") counts as unset
                 os.environ[key] = value
         return  # first .env found wins; don't also load the script-dir one
+
+
+def parse_du(text: str) -> tuple[str, str] | None:
+    """(domain user id, workspace id) from an inbox URL …/1/<workspace>/inbox/<du>/…,
+    or (du, "") from a bare number."""
+    text = text.strip().strip("'\"")
+    if m := re.search(r"/1/(\d+)/inbox/(\d+)", text):
+        return m.group(2), m.group(1)
+    if text.isdigit():
+        return text, ""
+    return None
+
+
+def parse_view(text: str) -> tuple[str, set[str]] | None:
+    """(objectViewId, {ids claiming to be the domain user}) from the WS `sub` message
+    JSON (or a bare number). The ids come from db_object_id / currentDomainUserId."""
+    text = text.strip()
+    if m := re.search(r'"?objectViewId"?\s*:\s*"?(\d+)"?', text):
+        du_ids = set(re.findall(r'"?(?:db_object_id|currentDomainUserId)"?\s*:\s*"?(\d+)"?', text))
+        return m.group(1), du_ids
+    bare = text.strip("'\"")  # an id copied with its quotes, e.g. "1650000000000000"
+    if bare.isdigit():
+        return bare, set()
+    return None
+
+
+def update_env_file(path: Path, values: dict[str, str]) -> bool:
+    """Set KEY=VALUE lines in an existing .env, keeping comments and other keys as-is
+    (later duplicates dropped). Returns True if the file already existed.
+    Writes via a temp file + rename so a failure can't truncate the old one."""
+    existed = path.exists()
+    path = path.resolve()  # write through symlinks (dotfiles managers), not over them
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines() if existed else []
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            key = line.removeprefix("export ").partition("=")[0].strip()
+            if key in values:
+                if key in seen:
+                    continue  # keep the first (updated) occurrence, drop later duplicates
+                out.append(f"{key}={values[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        out += [f"{k}={v}" for k, v in values.items() if k not in seen]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        if existed:
+            os.chmod(tmp, path.stat().st_mode)  # keep e.g. a pre-existing 0600
+        tmp.replace(path)
+    except UnicodeDecodeError as e:
+        raise AsanaError(f"{path} is not UTF-8 ({e}); re-save it as UTF-8 first") from e
+    except OSError as e:
+        raise AsanaError(f"cannot write {path}: {e}") from e
+    return existed
 
 
 # ---------------------------------------------------------------- Firefox cookies
@@ -892,6 +949,95 @@ def cmd_bootstrap(args) -> None:
         print(f"  {p} = {v!r}"[:200])
 
 
+def read_paste(prompt: str, parse) -> tuple[str, set[str]] | None:
+    """Read a possibly multi-line paste (pretty-printed JSON), accumulating until it
+    parses *and* looks complete (balanced braces) so keys on later lines — e.g.
+    db_object_id after objectViewId — aren't missed. A blank line ends the paste."""
+    buf = ""
+    while True:
+        line = input(prompt if not buf else "   …> ")
+        buf = f"{buf}\n{line}" if buf else line
+        if not line.strip():
+            return parse(buf) if buf.strip() else None  # blank line: paste is done
+        if (parsed := parse(buf)) and buf.count("{") <= buf.count("}"):
+            return parsed
+
+
+def cmd_setup(args) -> None:
+    """Guided setup: parse the two IDs from pasted URL / WS message, check the login,
+    write .env. Non-interactive when both a URL and --view are given."""
+    print("asana-inbox setup — collects your two IDs and writes .env\n")
+    try:
+        # 1) domain user id, from the inbox URL
+        du = ws = ""
+        if args.url:
+            parsed = parse_du(args.url)
+            if not parsed:
+                raise AsanaError(f"no …/1/<workspace>/inbox/<id>/ in {args.url!r}")
+            du, ws = parsed
+        while not du:
+            print("1) Domain user ID (ASANA_DU)")
+            print("   Open your Inbox in the Asana web app. The URL looks like")
+            print("   https://app.asana.com/1/<workspace>/inbox/<domain user id>/…")
+            parsed = parse_du(input("   Paste that URL (or just the number after /inbox/): "))
+            if parsed:
+                du, ws = parsed
+                break
+            print("   couldn't find /1/<workspace>/inbox/<number>/ in that — try again\n")
+        print(f"   → domain user id {du}"
+              + (f" (workspace {ws})" if ws else "") + "\n")
+
+        # 2) objectViewId, from the WS `sub` message (or --view)
+        while True:
+            view = None
+            du_ids: set[str] = set()
+            if args.view is not None:
+                view = str(args.view)  # argparse type=int already validated it
+            else:
+                print("2) Inbox view ID (ASANA_VIEW)")
+                print("   In the browser: DevTools → Network → WS, reload the Inbox page,")
+                print("   click the cdn.sync.app.asana.com connection, filter messages for")
+                print("   CurrentDomainUserProjectionInbox and open the outgoing (↑) \"sub\" message.")
+                print("   The id is at params.inboxThreadsInfo.multifilterParams.objectViewId.")
+                parsed = read_paste("   Paste the whole JSON message (or just the id):\n   (blank line to retry)", parse_view)
+                if parsed:
+                    view, du_ids = parsed
+            if not view:
+                print("   no objectViewId in that paste — try again\n")
+                continue
+            if du_ids and du not in du_ids:
+                print(f"   ⚠ the message's db_object_id {sorted(du_ids)} doesn't match domain user id {du}")
+                print("     — likely the wrong message or URL; check the README's Setup section")
+                if input("     use this objectViewId anyway? [y/N] ").strip().lower() != "y":
+                    print()
+                    continue
+            elif du_ids:
+                print("   ✓ db_object_id matches the domain user id")
+            elif not args.view:
+                print("   (no db_object_id in the paste to cross-check)")
+            break
+        print(f"   → objectViewId {view}\n")
+
+        # 3) login check (cheap: cookies only, no bundle download)
+        print("3) Asana login (cookies)")
+        try:
+            sess = Session(args.browser, args.profile, args.cookies)
+            print(f"   ✓ logged in via {sess.source} (user {sess.user_id}, domain {sess.domain})\n")
+        except (AsanaError, OSError) as e:  # OSError: e.g. --cookies file missing
+            print("   ✗ " + str(e).replace("\n", "\n     "))
+            print("     log in to app.asana.com, or re-run setup with --cookies FILE\n")
+
+        # 4) write .env in the directory we run from
+        env_path = Path.cwd() / ".env"
+        existed = update_env_file(env_path, {"ASANA_DU": du, "ASANA_VIEW": view})
+        print(f"{'updated' if existed else 'wrote'} {env_path}:")
+        print(f"  ASANA_DU={du}\n  ASANA_VIEW={view}")
+        print("\nTry it:  ./asana_web.py inbox -n 5   (or just ./asana_inbox.py)")
+    except (EOFError, KeyboardInterrupt):
+        print("\ncancelled; nothing written", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 def print_items(items: list[dict]) -> None:
     """Items grouped under their thread; ids are what `archive` takes."""
     by_thread: dict[str, list[dict]] = {}
@@ -988,6 +1134,10 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("cookies")
     sub.add_parser("bootstrap")
+    setup = sub.add_parser("setup", help="guided setup: parse the two IDs, check login, write .env")
+    setup.add_argument("url", nargs="?", help="inbox URL …/1/<workspace>/inbox/<du>/… (else prompted)")
+    setup.add_argument("--view", type=int, help="objectViewId if you already have it (else prompted)")
+    add_cookie_args(setup)  # also work after the subcommand, as the setup hints suggest
     inbox = sub.add_parser("inbox", help="list threads")
     arch = sub.add_parser("archive", help="archive items/threads by id (dry run unless --yes)")
     arch.add_argument("id", nargs="+", help="item id <thread>/<task>, or a thread id for the whole thread")
@@ -1005,6 +1155,8 @@ def main() -> None:
         cmd_cookies(args)
     elif args.cmd == "bootstrap":
         cmd_bootstrap(args)
+    elif args.cmd == "setup":
+        cmd_setup(args)
     elif args.cmd == "inbox":
         asyncio.run(cmd_inbox(args))
     else:
