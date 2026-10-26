@@ -32,7 +32,7 @@ You need two IDs. Both are fixed per user, so find them once.
    `https://app.asana.com/1/<workspace>/inbox/<domain user id>/…`; use the number after `/inbox/`.
    This is *not* the same as your user ID.
 2. **Inbox view ID** (`ASANA_VIEW`). The inbox doesn't load without it.
-   1. In the browser, open DevTools → Network → **WS**, then reload the Inbox page.
+   1. In the browser, open DevTools → Network → **WS**, then reload the Inbox page (Pressing `F12` usually works too)
    2. Click the `cdn.sync.app.asana.com/socket…` connection and filter its messages for `multifilterParams`.
    3. Select the outgoing (↑) message with `"msg":"sub"` and `"name":"CurrentDomainUserProjectionInbox"`.
       The ID is at `params.inboxThreadsInfo.multifilterParams.objectViewId`:
