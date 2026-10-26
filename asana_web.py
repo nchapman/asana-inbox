@@ -26,6 +26,8 @@ Cookies (global options, before the subcommand):
 
 Env: ASANA_UA (User-Agent override), ASANA_FF_CONTAINER (Firefox container id),
      ASANA_DOMAIN (workspace gid; default: last_domain cookie).
+     All ASANA_* vars may also live in a .env file (working dir, else script dir;
+     see README) — the real environment wins.
 """
 
 import argparse
@@ -62,6 +64,57 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "asana-
 
 class AsanaError(RuntimeError):
     """Expected failure with a human-readable message (auth, HTTP, protocol)."""
+
+
+def load_env_file() -> None:
+    """Set ASANA_* environment variables from a .env file: the current directory first,
+    else one next to the script. KEY=VALUE lines; `#` comments (own line or trailing),
+    optional `export ` and quotes. Only ASANA_* keys are honored; variables already in
+    the environment keep their value; empty values count as unset; later lines win."""
+    for base in (Path.cwd(), Path(__file__).resolve().parent):
+        f = base / ".env"
+        if not f.is_file():
+            continue
+        preset = set(os.environ)  # real environment wins over the file
+        try:
+            text = f.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError as e:
+            raise AsanaError(f"cannot read {f}: {e}") from e
+        parsed: dict[str, str] = {}  # parsed fully first: a bad line sets nothing
+        skipped = nul = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.removeprefix("export ").partition("=")
+            key, value = key.strip(), value.strip()
+            if value.startswith("#"):  # e.g. "ASANA_DU= # get it from the URL" — empty value
+                value = ""
+            elif value[:1] in ('"', "'"):  # quoted: take the inside; ignore any trailing comment
+                end = value.find(value[0], 1)
+                if end < 0:
+                    raise AsanaError(f"{f}: unterminated quote in value of {key!r}")
+                value = value[1:end]
+            else:  # unquoted: drop a trailing " # comment"
+                value = re.split(r"\s#", value, 1)[0].rstrip()
+            if not key:
+                continue
+            if "\0" in key + value:  # UTF-16 and other binary encodings decode with NULs
+                nul += 1
+                continue
+            if not key.startswith("ASANA_"):
+                skipped += 1
+            else:
+                parsed[key] = value
+        if nul:
+            print(f"warning: {f}: {nul} line(s) with NUL bytes — UTF-16? save the file as UTF-8",
+                  file=sys.stderr)
+        if skipped:
+            print(f"warning: {f}: skipped {skipped} non-ASANA_* key(s)", file=sys.stderr)
+        for key, value in parsed.items():
+            if value and key not in preset:  # empty value (e.g. "KEY= # TODO") counts as unset
+                os.environ[key] = value
+        return  # first .env found wins; don't also load the script-dir one
 
 
 # ---------------------------------------------------------------- Firefox cookies
@@ -926,6 +979,10 @@ def add_cookie_args(ap: argparse.ArgumentParser) -> None:
 
 
 def main() -> None:
+    try:
+        load_env_file()
+    except AsanaError as e:  # a broken .env shouldn't stop cookie listing and friends
+        print(f"warning: {e}", file=sys.stderr)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_cookie_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)

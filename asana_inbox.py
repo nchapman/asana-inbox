@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -672,6 +673,11 @@ class InboxApp(App):
 
 
 def main() -> None:
+    from asana_web import load_env_file  # reads .env before the ASANA_* defaults below
+    try:
+        load_env_file()
+    except RuntimeError as e:  # AsanaError: warn, but e.g. --fake needs no env at all
+        print(f"warning: {e}", file=sys.stderr)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fake", action="store_true", help="use generated data, no Asana")
     ap.add_argument("--du", default=os.environ.get("ASANA_DU"), help="domain user id (env ASANA_DU)")

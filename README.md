@@ -54,6 +54,8 @@ export ASANA_DU=<domain user id>
 export ASANA_VIEW=<objectViewId>
 ```
 
+…or in a `.env` file in the directory you run from (or next to the scripts) — `KEY=value` per line, `#` comments allowed on their own or after a value. It covers every `ASANA_*` variable below, and variables already in your shell win. `.env` is already gitignored.
+
 ## Running
 
 ```sh
