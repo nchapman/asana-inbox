@@ -51,7 +51,11 @@ import websockets
 
 APP = "https://app.asana.com"
 WS_HOST = "cdn.sync.app.asana.com"
-UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+MAC = sys.platform == "darwin"
+# UA platform tokens differ per browser; match the real OS so Cloudflare's cf_clearance stays valid
+UA_FF_PLATFORM = "Macintosh; Intel Mac OS X 10.15" if MAC else "X11; Linux x86_64"
+UA_CHROME_PLATFORM = "Macintosh; Intel Mac OS X 10_15_7" if MAC else "X11; Linux x86_64"
+UA = f"Mozilla/5.0 ({UA_FF_PLATFORM}; rv:140.0) Gecko/20100101 Firefox/140.0"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "asana-inbox"
 
 
@@ -63,6 +67,7 @@ class AsanaError(RuntimeError):
 # ---------------------------------------------------------------- Firefox cookies
 
 FIREFOX_ROOTS = [
+    Path.home() / "Library/Application Support/Firefox",  # macOS
     Path.home() / ".mozilla/firefox",
     Path.home() / ".config/mozilla/firefox",
     Path.home() / "snap/firefox/common/.mozilla/firefox",
@@ -151,10 +156,15 @@ def firefox_user_agent(profile: Path) -> str:
     """Match the profile's Firefox version so Cloudflare's cf_clearance stays valid."""
     if ua := os.environ.get("ASANA_UA"):
         return ua
+    ver = "140"
     ini = profile / "compatibility.ini"
-    m = re.search(r"LastVersion=(\d+)\.", ini.read_text()) if ini.exists() else None
-    ver = m.group(1) if m else "140"
-    return f"Mozilla/5.0 (X11; Linux x86_64; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"
+    try:
+        m = re.search(r"LastVersion=(\d+)\.", ini.read_text()) if ini.exists() else None
+        if m:
+            ver = m.group(1)
+    except OSError as e:  # unreadable file: skip this browser in the auto-detect loop
+        raise AsanaError(f"cannot read {ini}: {e}") from e
+    return f"Mozilla/5.0 ({UA_FF_PLATFORM}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0"
 
 
 def cookie_header(cookies: list[tuple[str, str, str]], host: str) -> str:
@@ -171,14 +181,20 @@ def cookie_header(cookies: list[tuple[str, str, str]], host: str) -> str:
 
 Cookies = list[tuple[str, str, str]]  # (host, name, value)
 
-# browser_cookie3 loader name, config dir under ~/.config (for the UA version)
+# browser_cookie3 loader name, config dir under ~/.config (Linux) or
+# ~/Library/Application Support (macOS); the dir also holds the UA's "Last Version"
 CHROMIUMS = {
-    "chrome": ("chrome", "google-chrome"),
-    "chromium": ("chromium", "chromium"),
-    "brave": ("brave", "BraveSoftware/Brave-Browser"),
-    "edge": ("edge", "microsoft-edge"),
+    "chrome": ("chrome", "google-chrome", "Google/Chrome"),
+    "chromium": ("chromium", "chromium", "Chromium"),
+    "brave": ("brave", "BraveSoftware/Brave-Browser", "BraveSoftware/Brave-Browser"),
+    "edge": ("edge", "microsoft-edge", "Microsoft Edge"),
 }
 BROWSERS = ["firefox", *CHROMIUMS]
+
+
+def chromium_confdir(confdir_linux: str, confdir_mac: str) -> Path:
+    base = Path.home() / ("Library/Application Support" if MAC else ".config")
+    return base / (confdir_mac if MAC else confdir_linux)
 
 
 def chromium_cookies(browser: str, profile: str | None) -> Cookies:
@@ -187,14 +203,15 @@ def chromium_cookies(browser: str, profile: str | None) -> Cookies:
         import browser_cookie3
     except ImportError as e:
         raise AsanaError("browser_cookie3 not installed (run via `uv run`)") from e
-    loader, confdir = CHROMIUMS[browser]
-    if not profile and not (Path.home() / ".config" / confdir).is_dir():
-        raise AsanaError(f"not installed (no ~/.config/{confdir})")
+    loader, confdir_linux, confdir_mac = CHROMIUMS[browser]
+    confdir = chromium_confdir(confdir_linux, confdir_mac)
+    if not profile and not confdir.is_dir():
+        raise AsanaError(f"not installed (no {confdir})")
     cookie_file = None
     if profile:  # profile dir name ("Default", "Profile 1"), profile dir path, or Cookies file
         p = Path(profile).expanduser()
         if not p.exists():
-            p = Path.home() / ".config" / confdir / profile
+            p = confdir / profile
         cookie_file = next((str(c) for c in (p, p / "Network/Cookies", p / "Cookies") if c.is_file()), None)
         if not cookie_file:
             raise AsanaError(f"no {browser} Cookies file under {p}")
@@ -206,10 +223,16 @@ def chromium_cookies(browser: str, profile: str | None) -> Cookies:
 
 
 def chromium_user_agent(browser: str) -> str:
-    _, confdir = CHROMIUMS[browser]
-    f = Path.home() / ".config" / confdir / "Last Version"
-    major = f.read_text().split(".")[0] if f.exists() else "140"
-    return (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    _, confdir_linux, confdir_mac = CHROMIUMS[browser]
+    f = chromium_confdir(confdir_linux, confdir_mac) / "Last Version"
+    major = "140"
+    try:
+        m = re.match(r"\d+", f.read_text().strip()) if f.exists() else None
+        if m:  # empty/truncated file (Chrome rewrites it during updates) falls back
+            major = m.group(0)
+    except OSError as e:  # unreadable file: skip this browser in the auto-detect loop
+        raise AsanaError(f"cannot read {f}: {e}") from e
+    return (f"Mozilla/5.0 ({UA_CHROME_PLATFORM}) AppleWebKit/537.36 (KHTML, like Gecko) "
             f"Chrome/{major}.0.0.0 Safari/537.36")
 
 
